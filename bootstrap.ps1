@@ -33,6 +33,8 @@ $CfgPath   = Join-Path $AgentDir 'config.json'
 $Paused    = Join-Path $AgentDir 'paused'
 $ClaudeDir = Join-Path $HOME '.claude'
 $TaskName  = 'agent-watchdog'
+# the remote helper's Claude session (same account) that receives the setup report; it renames itself to this with /rename
+$Coordinator = if ($env:AGENT_SETUP_COORDINATOR) { $env:AGENT_SETUP_COORDINATOR } else { 'agent-coordinator' }
 $TgtermUrl    = 'https://raw.githubusercontent.com/dead1786/agent-setup/30dd69f52b57cb80a9fd08031efb194484505af0/tgterm.py'
 $TgtermSha256 = '2f139c58d25b15e5e0b6a9fdb973124615195b7ea9aba00a64fe36c1015fbb31'
 $McpTools  = 'Screenshot,Snapshot,DisplayInventory,ControlStatus,WaitFor,Wait,Clipboard,Click,Type,Scroll,Move,Shortcut,App'
@@ -713,11 +715,11 @@ This computer was just prepared by its owner's own setup script. You are this ma
 1. Run this command and keep its full output. It takes up to 8 minutes, so use a 10-minute timeout:
    powershell -NoProfile -ExecutionPolicy Bypass -File '$VerifyPath'
    As part of the install the owner asked for, it types one test message into the owner's AI window ($agentName) and closes that window once to check that it reopens by itself.
-2. A setup coordinator session on the same account will message you. Reply to that message with the complete, unedited verify output plus one line naming anything that failed. Do not look the coordinator up by name; just reply to its message.
+2. Report to the setup coordinator, a session on the same account named exactly $Coordinator. As soon as verify finishes, use ListAgents to find the session named $Coordinator and send it the complete, unedited verify output plus one line naming anything that failed. If no session with that exact name is listed, do not message anyone else: wait, and when the coordinator messages you, reply to that message with the same content.
 3. For the rest of this setup the owner pre-authorizes: re-running verify.ps1 (optionally with -SkipInject or -SkipWatchdog), reading files and logs under C:\AI and $SetupDir, and fixing the generated scripts under C:\AI\.agent when the coordinator points to a concrete bug in them. Report every change to the coordinator.
-4. Finishing (the owner set this up so they can leave this computer safely): right after you have sent the coordinator the verify output, if verify reported 0 failed, run this command; it ends this session, and this window then signs the installer's Claude account out by itself:
+4. Finishing (the owner set this up so they can leave this computer safely): after reporting, wait for the coordinator's answer. When the coordinator confirms the setup is complete and tells you to finish, or when the owner types 結束安裝 in this window, run this command; it ends this session, and this window then signs the installer's Claude account out by itself:
    powershell -NoProfile -ExecutionPolicy Bypass -File '$FinishPath'
-   If anything failed, do not finish yet: wait until the coordinator tells you to finish, or until the owner types 結束安裝 in this window, then run the same command.
+   If the coordinator asks for more checks instead, do them (within item 3) and report again.
 Do not change files under ~/.claude or the rules file, do not delete anything outside C:\AI\.agent, do not spend money, and do not message anyone except the coordinator.
 "@
 Write-Text (Join-Path $SetupDir 'setup-prompt.txt') $prompt
@@ -727,7 +729,7 @@ Say '安裝完成，接下來會自動進行：' 'Green'
 Say "  1. 「$agentName」的視窗已經開著（關掉也會在 1 分鐘內自己重開）。" 'Green'
 if ($ai -eq 'gemini') { Say '  2. Antigravity 第一次啟動會要你登入，請用你自己的 Google 帳號。' 'Yellow' }
 if ($tg) { Say "  *. 檢查時會傳一句「安裝測試成功」到你的 Telegram（@$botName），這是正常的。" 'Green' }
-Say '  這個視窗會變成「安裝助理」，自動檢查並回報給遠端協助者；檢查全過後它會自己結束，並自動登出安裝者的 Claude 帳號。' 'Green'
+Say '  這個視窗會變成「安裝助理」，自動檢查並主動回報給遠端協助者；協助者確認沒問題後，它會自己結束並自動登出安裝者的 Claude 帳號。' 'Green'
 Say '  看到「✅ 已登出…可以關閉這個視窗了」再關。不要直接按 X 關掉（那樣不會登出）。' 'Yellow'
 if (-not $DryRun) {
     Stop-Transcript | Out-Null
