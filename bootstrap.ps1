@@ -19,7 +19,6 @@ $GitDir   = Join-Path $Programs 'PortableGit'
 $NodeDir  = Join-Path $Programs 'nodejs'
 $LocalBin = Join-Path $HOME '.local\bin'
 $McpTools = 'Screenshot,Snapshot,DisplayInventory,ControlStatus,WaitFor,Wait,Clipboard,Click,Type,Scroll,Move,Shortcut,App'
-$SetupPeer = 'frosty-10'
 $Utf8 = New-Object Text.UTF8Encoding $false
 
 function Say($msg, $color = 'Cyan') { Write-Host $msg -ForegroundColor $color }
@@ -380,12 +379,14 @@ def main():
                 if not chat or not text:
                     continue
                 owner = cfg.get("owner_chat_id")
-                if owner is None and text.strip().startswith("/start"):
+                if owner is None and (m.get("chat") or {}).get("type") == "private":
                     cfg["owner_chat_id"] = chat
+                    owner = chat
                     save(cfg)
                     log("owner set %s" % chat)
-                    send(chat, "已連線，之後直接傳訊息給我就好。")
-                    continue
+                    send(chat, "已綁定為主人，之後直接傳訊息給我就好。")
+                    if text.strip().startswith("/start"):
+                        continue
                 if chat != owner:
                     log("ignored chat %s" % chat)
                     continue
@@ -427,15 +428,15 @@ sh.Run """$uvExe"" run --python 3.12 ""$BridgeDir\bridge.py""", 0, False
 $verify = @"
 `$ErrorActionPreference = 'Continue'
 `$env:Path = [Environment]::GetEnvironmentVariable('Path','User') + ';' + [Environment]::GetEnvironmentVariable('Path','Machine')
-function H(`$t) { Write-Output ''; Write-Output ('### ' + `$t) }
-H 'answers'; Get-Content '$SetupDir\answers.json'
-H 'versions'; uv --version; git --version; jq --version; claude --version
+function Show-Section(`$t) { Write-Output ''; Write-Output ('### ' + `$t) }
+Show-Section 'answers'; Get-Content '$SetupDir\answers.json'
+Show-Section 'versions'; uv --version; git --version; jq --version; claude --version
 if ('$ai' -eq 'codex') { codex --version }; if ('$ai' -eq 'gemini') { gemini --version }
-H 'windows-mcp'; git -C '$McpDir' remote -v; git -C '$McpDir' log -1 --oneline; claude mcp list
-H 'claude settings'; Get-Content '$SettingsPath'
-H 'rules + memory'; Get-Item '$Root\$rulesName','$MemDir\MEMORY.md' | Select-Object FullName,Length
+Show-Section 'windows-mcp'; git -C '$McpDir' remote -v; git -C '$McpDir' log -1 --oneline; claude mcp list
+Show-Section 'claude settings'; Get-Content '$SettingsPath'
+Show-Section 'rules + memory'; Get-Item '$Root\$rulesName','$MemDir\MEMORY.md' | Select-Object FullName,Length
 if (Test-Path '$BridgeDir\config.json') {
-  H 'telegram'; `$c = Get-Content '$BridgeDir\config.json' -Raw | ConvertFrom-Json
+  Show-Section 'telegram'; `$c = Get-Content '$BridgeDir\config.json' -Raw -Encoding UTF8 | ConvertFrom-Json
   Write-Output ('owner_chat_id=' + `$c.owner_chat_id)
   Get-CimInstance Win32_Process | Where-Object { `$_.CommandLine -like '*tg-bridge*bridge.py*' } | Select-Object ProcessId,Name
   if (Test-Path '$BridgeDir\bridge.log') { Get-Content '$BridgeDir\bridge.log' -Tail 5 }
@@ -470,10 +471,10 @@ Step 'Claude 登入' { claude auth login --claudeai; Check 'claude auth login' }
 
 $prompt = @"
 This computer was just prepared by the owner's own bootstrap script (C:\AI\setup). You are the setup assistant for this machine.
-1. Run: powershell -ExecutionPolicy Bypass -File C:\AI\setup\verify.ps1
-2. Send the full output, unedited, to the session $SetupPeer via SendMessage, with a one-line summary of anything missing or failing.
-3. For the rest of this setup, the owner authorizes these actions without asking: fixing failed install steps from this bootstrap, creating or editing files under C:\AI and ~/.claude, restarting the Telegram bridge, and re-running verify.ps1. Follow $SetupPeer's plan for those, report results to $SetupPeer, and send questions about the setup to $SetupPeer.
-Do not delete files outside C:\AI and ~/.claude, do not spend money, and do not message anyone other than $SetupPeer and the owner's Telegram chat.
+1. Run: powershell -ExecutionPolicy Bypass -File C:\AI\setuperify.ps1 and keep the full output.
+2. A setup coordinator session (owned by the same account) will message you shortly. Reply to that message with the full unedited verify output and a one-line summary of anything missing or failing. Do not look the coordinator up by name; just reply to its message.
+3. For the rest of this setup, the owner authorizes these actions without asking: fixing failed install steps from this bootstrap, creating or editing files under C:\AI and ~/.claude, restarting the Telegram bridge, and re-running verify.ps1. Follow the coordinator's plan for those, report results to it, and send questions about the setup to it instead of the person at this keyboard.
+Do not delete files outside C:\AI and ~/.claude, do not spend money, and do not message anyone other than the coordinator and the owner's Telegram chat.
 "@
 Write-Text (Join-Path $SetupDir 'setup-prompt.txt') $prompt
 
