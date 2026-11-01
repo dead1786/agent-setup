@@ -1,0 +1,10 @@
+{
+  "_comment": "winject default targets, shipped with the installer and never edited in place. The targets in use are in C:\\AI\\.agent\\winject-data\\targets.json (copied from this file the first time add-target / remove-target runs). type: window | line. title: the whole window title, or title_from_config: a key of C:\\AI\\.agent\\config.json read at send time.",
+  "agent": {
+    "type": "window",
+    "title_from_config": "agent_name",
+    "priority": "high",
+    "prefix": true,
+    "note": "this computer's AI window (its title is config.json agent_name)"
+  }
+}

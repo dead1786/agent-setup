@@ -381,18 +381,22 @@ def focus(hwnd):
     return u32.GetForegroundWindow() == hwnd
 
 
-def inject_paste(title, text):
-    # share winsend.py's lock so a LINE / window send and this paste never fight over the focus
+def with_winsend_lock(fn, *args):
+    # share winsend.py / winject's lock so a LINE or window send and our typing never interleave
     mutex = k32.CreateMutexW(None, False, "Local\\agent-winsend")
     if mutex and k32.WaitForSingleObject(mutex, 60000) in (0, 0x80):      # signaled or abandoned
         try:
-            return _inject_paste(title, text)
+            return fn(*args)
         finally:
             k32.ReleaseMutex(mutex)
             k32.CloseHandle(mutex)
     if mutex:
         k32.CloseHandle(mutex)
     raise RuntimeError("another window send is still running")
+
+
+def inject_paste(title, text):
+    return with_winsend_lock(_inject_paste, title, text)
 
 
 def _inject_paste(title, text):
@@ -463,7 +467,7 @@ def inject(cfg, text, mode=None):
     mode = mode or cfg.get("mode", "console")
     if mode == "paste":
         return inject_paste(cfg.get("agent_name", ""), text)
-    return inject_console(text)
+    return with_winsend_lock(inject_console, text)
 
 
 # ---------------------------------------------------------------- screenshots, voice
@@ -554,9 +558,20 @@ INCOMING = (
     ("animation", "[動圖]"), ("voice", "[語音]"), ("audio", "[音訊]"), ("sticker", "[貼圖]"),
 )
 COMMANDS = [("status", "AI 狀態"), ("stop", "中斷 AI 正在做的事"), ("restart", "重開 AI 視窗"),
-            ("new", "重開並開始新對話"), ("screen", "傳目前的電腦畫面"), ("help", "指令說明")]
+            ("new", "重開並開始新對話"), ("screen", "傳目前的電腦畫面"),
+            ("allow", "放行安全防護剛擋下的動作一次"), ("help", "指令說明")]
 ALIASES = {"狀態": "status", "停": "stop", "停止": "stop", "重開": "restart", "新對話": "new",
-           "畫面": "screen", "截圖": "screen", "說明": "help"}
+           "畫面": "screen", "截圖": "screen", "允許": "allow", "放行": "allow", "說明": "help"}
+ALLOW = os.path.join(BASE, "allow-once")                # read and removed by guard.py
+
+
+def last_blocked():
+    try:
+        with open(os.path.join(BASE, "guard.log"), encoding="utf-8") as f:
+            lines = [l for l in f.read().splitlines() if " BLOCKED " in l]
+    except OSError:
+        return ""
+    return lines[-1].split(" BLOCKED ", 1)[1][:400] if lines else ""
 _awaiting = {"since": 0.0}                              # when the AI got a Telegram message it has not answered yet
 
 
@@ -628,10 +643,17 @@ def command(cfg, name):
         send(cfg, "AI 視窗已重開%s。" % ("，這次是新的對話" if name == "new" else "，會接著之前的對話"))
     elif name == "screen":
         send_media(cfg, "photo", screenshot(), "目前的電腦畫面 " + time.strftime("%H:%M"))
+    elif name == "allow":
+        with open(ALLOW, "w", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
+        what = last_blocked()
+        send(cfg, "已放行：AI 在 10 分鐘內可以做「一次」剛才被安全防護擋下的動作。" +
+             ("\n最近一次被擋的是：%s" % what if what else "") +
+             "\n不確定它要做什麼的話，先問清楚再放行。")
     else:
         send(cfg, "直接傳訊息就是跟 AI 說話；圖片、檔案、影片、語音都可以傳。\n" +
              "\n".join("/%s  %s" % c for c in COMMANDS) +
-             "\n（也可以打中文：/狀態 /停 /重開 /新對話 /畫面）")
+             "\n（也可以打中文：/狀態 /停 /重開 /新對話 /畫面 /允許）")
 
 
 def handle(cfg, m):
@@ -908,6 +930,17 @@ def watchdog():
         subprocess.Popen([pyw if os.path.exists(pyw) else sys.executable, os.path.abspath(__file__), "bridge"],
                          cwd=BASE, creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, close_fds=True)
         log("started Telegram bridge", WATCHDOG_LOG)
+    wj = os.path.join(BASE, "winject", "cli.py")
+    if os.path.exists(wj):                              # keep the winject send queue running
+        try:
+            py = os.path.join(os.path.dirname(sys.executable), "python.exe")
+            r = subprocess.run([py if os.path.exists(py) else sys.executable, wj, "ensure-dispatcher"], cwd=BASE,
+                               capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+                               creationflags=CREATE_NO_WINDOW)
+            if not (r.stdout or "").startswith("OK: dispatcher running"):
+                log("winject: " + ((r.stdout or "") + (r.stderr or "")).strip()[:500], WATCHDOG_LOG)
+        except Exception:
+            log("winject: " + traceback.format_exc(), WATCHDOG_LOG)
 
 
 def merge_json(target, patch_file):

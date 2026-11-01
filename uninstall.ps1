@@ -81,6 +81,7 @@ foreach ($proc in $all) {
     if ($keep.ContainsKey([long]$proc.ProcessId)) { continue }
     $cmdline, $exe = [string]$proc.CommandLine, [string]$proc.ExecutablePath
     $isOurs = $cmdline -like '*run-agent.ps1*' -or $cmdline -like '*tgterm.py*' -or $cmdline -like '*winsend.py*' -or
+              $cmdline -like '*winject*dispatcher*' -or
               $cmdline -like '*--remote-control agent-setup*' -or ($exe -and @($ownDirs | Where-Object { $exe -like $_ }).Count)
     if ($isOurs) { cmd /c "taskkill /PID $($proc.ProcessId) /T /F >nul 2>&1" }
 }
@@ -95,6 +96,9 @@ if ($keepMemory) {
 }
 
 # 3. put back the settings the installer changed (needs the installer's Python, so before C:\AI goes)
+# the safety guard's hooks first: only our entries go, hooks the user added stay
+$guard = Join-Path $AgentDir 'guard.py'
+if ((Test-Path $Py) -and (Test-Path $guard)) { & $Py $guard remove | Out-Host }
 if ((Test-Path $Py) -and (Test-Path $Tgterm)) {
     $restore = { param($file, [string[]]$keys)
         if (Test-Path -LiteralPath $file) {
@@ -108,7 +112,7 @@ if ((Test-Path $Py) -and (Test-Path $Tgterm)) {
         if ((Get-Command claude -ErrorAction SilentlyContinue) -and -not ($Man -and $Man.mcp_preexisting)) {
             cmd /c "claude mcp remove windows-mcp --scope user >nul 2>&1"
         }
-        foreach ($s in 'winsend', 'memory-rag') { Remove-Path (Join-Path $ClaudeDir "skills\$s") }
+        foreach ($s in 'winsend', 'memory-rag', 'winject', 'alarm-system', 'watchdog-alert') { Remove-Path (Join-Path $ClaudeDir "skills\$s") }
         Remove-Path (Join-Path $ClaudeDir 'agent-setup-statusline.sh')
     }
     # ~/.gemini\config stays even when Antigravity itself is removed, so always put it back

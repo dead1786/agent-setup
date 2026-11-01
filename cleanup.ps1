@@ -70,7 +70,7 @@ while ($p -and -not $keep.ContainsKey($p)) {
 $procs = @($all | Where-Object {
     -not $keep.ContainsKey([long]$_.ProcessId) -and (
         $_.CommandLine -like '*run-agent.ps1*' -or $_.CommandLine -like '*tgterm.py*' -or
-        $_.CommandLine -like '*tg-bridge*bridge.py*' -or $_.Name -eq 'claude.exe' -or (Test-Under $_.ExecutablePath))
+        $_.CommandLine -like '*tg-bridge*bridge.py*' -or $_.CommandLine -like '*winject*dispatcher*' -or $_.Name -eq 'claude.exe' -or (Test-Under $_.ExecutablePath))
 })
 $task = (cmd /c "schtasks /Query /TN agent-watchdog >nul 2>&1"); $hasTask = ($LASTEXITCODE -eq 0)
 
