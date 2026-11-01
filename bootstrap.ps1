@@ -630,27 +630,46 @@ $VerifyPath = Join-Path $SetupDir 'verify.ps1'
 Write-Text $VerifyPath (Fill $verify $map) -Bom
 
 $handoff = @'
-# Delivery: undo the setup-only settings, sign out the installer's Claude account, let the new owner sign in, reopen the AI window
+# Delivery: undo the setup-only settings, sign the installer's Claude account out, and (AI = Claude) reopen the AI window
+# so the new owner signs in there with their own account. Runs by itself when the setup assistant ends.
 $ErrorActionPreference = 'Continue'
+try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 $env:Path = [Environment]::GetEnvironmentVariable('Path', 'User') + ';' + [Environment]::GetEnvironmentVariable('Path', 'Machine')
 $env:PYTHONUTF8 = '1'
 $py = '__PY__'; $tgterm = '__TGTERM__'
 $patch = Join-Path $env:TEMP 'agent-handoff-patch.json'
 [IO.File]::WriteAllText($patch, '{"crossSessionInbound": null, "disableClaudeAiConnectors": null, "permissions": {"defaultMode": null}}', (New-Object Text.UTF8Encoding $false))
-& $py $tgterm merge-json (Join-Path $HOME '.claude\settings.json') $patch
+& $py $tgterm merge-json (Join-Path $HOME '.claude\settings.json') $patch | Out-Null
 Remove-Item $patch -Force
-claude auth logout
-Write-Host '已登出安裝者的 Claude 帳號。' -ForegroundColor Green
-if ('__AI__' -eq 'claude') {
-    Write-Host '接下來請用「你自己的」Claude 帳號登入。' -ForegroundColor Yellow
-    claude auth login
-    & $py $tgterm close-window | Out-Null
-    Write-Host 'AI 視窗會在 1 分鐘內用你的帳號重新開啟。' -ForegroundColor Green
-} else {
-    Write-Host '你的 AI 本來就是用你自己的帳號登入，不受影響。' -ForegroundColor Green
+cmd /c "claude auth logout >nul 2>&1"
+$status = cmd /c "claude auth status 2>nul" | Out-String
+if ($status -match '"loggedIn"\s*:\s*true') {
+    Write-Host '⚠️ 登出沒有成功，請在這個視窗輸入 claude auth logout 再試一次。' -ForegroundColor Red
+    exit 1
 }
+if ('__AI__' -eq 'claude') {
+    # the AI window still holds the installer's sign-in in memory: restart it so it asks for the owner's own account
+    & $py $tgterm close-window | Out-Null
+    Start-Sleep -Seconds 3
+    Remove-Item (Join-Path '__AGENTDIR__' 'watchdog.lock') -Force -ErrorAction SilentlyContinue
+    & $py $tgterm watchdog
+    Write-Host 'AI 視窗已重新開啟：請在那個視窗用「你自己的」Claude 帳號登入。' -ForegroundColor Yellow
+}
+Write-Host ''
+Write-Host '✅ 已登出安裝者的 Claude 帳號（已確認），可以關閉這個視窗了。' -ForegroundColor Green
 '@
-Write-Text (Join-Path $SetupDir 'handoff.ps1') (Fill $handoff @{ '__PY__' = $Py; '__TGTERM__' = $Tgterm; '__AI__' = $ai }) -Bom
+$HandoffPath = Join-Path $SetupDir 'handoff.ps1'
+Write-Text $HandoffPath (Fill $handoff @{ '__PY__' = $Py; '__TGTERM__' = $Tgterm; '__AI__' = $ai; '__AGENTDIR__' = $AgentDir }) -Bom
+
+$finish = @'
+# Ends the setup assistant (the Claude session started with --remote-control agent-setup).
+# Its window then runs handoff.ps1 by itself, which signs the installer's Claude account out.
+Get-CimInstance Win32_Process -Filter "Name='claude.exe'" |
+    Where-Object { $_.CommandLine -like '*--remote-control agent-setup*' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+'@
+$FinishPath = Join-Path $SetupDir 'finish-setup.ps1'
+Write-Text $FinishPath $finish -Bom
 
 # ---------------------------------------------------------------- 8. sign-ins, open the AI window, hand over to the setup session
 Say ''
@@ -696,6 +715,9 @@ This computer was just prepared by its owner's own setup script. You are this ma
    As part of the install the owner asked for, it types one test message into the owner's AI window ($agentName) and closes that window once to check that it reopens by itself.
 2. A setup coordinator session on the same account will message you. Reply to that message with the complete, unedited verify output plus one line naming anything that failed. Do not look the coordinator up by name; just reply to its message.
 3. For the rest of this setup the owner pre-authorizes: re-running verify.ps1 (optionally with -SkipInject or -SkipWatchdog), reading files and logs under C:\AI and $SetupDir, and fixing the generated scripts under C:\AI\.agent when the coordinator points to a concrete bug in them. Report every change to the coordinator.
+4. Finishing (the owner set this up so they can leave this computer safely): right after you have sent the coordinator the verify output, if verify reported 0 failed, run this command; it ends this session, and this window then signs the installer's Claude account out by itself:
+   powershell -NoProfile -ExecutionPolicy Bypass -File '$FinishPath'
+   If anything failed, do not finish yet: wait until the coordinator tells you to finish, or until the owner types 結束安裝 in this window, then run the same command.
 Do not change files under ~/.claude or the rules file, do not delete anything outside C:\AI\.agent, do not spend money, and do not message anyone except the coordinator.
 "@
 Write-Text (Join-Path $SetupDir 'setup-prompt.txt') $prompt
@@ -705,7 +727,8 @@ Say '安裝完成，接下來會自動進行：' 'Green'
 Say "  1. 「$agentName」的視窗已經開著（關掉也會在 1 分鐘內自己重開）。" 'Green'
 if ($ai -eq 'gemini') { Say '  2. Antigravity 第一次啟動會要你登入，請用你自己的 Google 帳號。' 'Yellow' }
 if ($tg) { Say "  *. 檢查時會傳一句「安裝測試成功」到你的 Telegram（@$botName），這是正常的。" 'Green' }
-Say '  這個視窗會變成「安裝助理」，自動檢查並回報給遠端協助者，請不要關掉它。' 'Green'
+Say '  這個視窗會變成「安裝助理」，自動檢查並回報給遠端協助者；檢查全過後它會自己結束，並自動登出安裝者的 Claude 帳號。' 'Green'
+Say '  看到「✅ 已登出…可以關閉這個視窗了」再關。不要直接按 X 關掉（那樣不會登出）。' 'Yellow'
 if (-not $DryRun) {
     Stop-Transcript | Out-Null
     Set-Location $SetupDir
@@ -713,6 +736,12 @@ if (-not $DryRun) {
     $Host.UI.RawUI.WindowTitle = '安裝助理（裝完可關）'
     $env:CLAUDE_CODE_DISABLE_TERMINAL_TITLE = '1'
     claude --dangerously-skip-permissions --remote-control agent-setup $prompt
+    # the setup assistant has ended (it finishes itself after a clean check, or the owner exited it): always sign the installer out
+    Say ''
+    Say '安裝助理已結束，正在登出安裝者的 Claude 帳號…' 'Green'
+    $Host.UI.RawUI.WindowTitle = '安裝助理：登出中'
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $HandoffPath
+    $Host.UI.RawUI.WindowTitle = $(if ($LASTEXITCODE -eq 0) { '安裝完成（可關閉）' } else { '登出失敗：請看視窗訊息' })
 } else {
     Say ('[dry-run] would run: claude --dangerously-skip-permissions --remote-control agent-setup <prompt> (in ' + $SetupDir + ')') 'DarkGray'
     Say ('[dry-run] done. ai=' + $ai + ' rules=' + $rulesName + ' telegram=' + $tg) 'Green'
