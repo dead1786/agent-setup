@@ -36,14 +36,25 @@ $TaskName  = 'agent-watchdog'
 # the remote helper's Claude session (same account) that receives the setup report; it renames itself to this with /rename
 $Coordinator = if ($env:AGENT_SETUP_COORDINATOR) { $env:AGENT_SETUP_COORDINATOR } else { 'agent-coordinator' }
 # helper files, pinned to one commit and checked by SHA-256 (a CDN cache can never hand out another version)
-$PinCommit = '47b1b111c038515a81ae1dc68e2c208b3dc8556b'
+$PinCommit = 'fadc604b30d1b5d80912c4e1e7c0963ba02fa84a'
 $PinFiles  = [ordered]@{
-    'tgterm.py'                  = 'f6f0ecee995acfb2b3b2b61de55ecbc3cc70e19a9e2dd21dbe57b48563699f5c'
+    'tgterm.py'                  = 'b2811d523ce0222d6e9964ec4530a7546f05f8a0eb1f454a9c688a066c9b8049'
     'winsend.py'                 = '0089b099a5196819cb891a6339dc03508f23204743adaff4517979e8295e5fa1'
     'skills/winsend/SKILL.md'    = '1f52e2fc29145ab7fa1ca4ac1a39eac9910b5b49306cce2716e452ffd7ada891'
     'skills/memory-rag/SKILL.md' = '21a521973b965eb624b0a1853e01299aefadbc1a2d793ca3bd3ac8cd6fb0de55'
+    'guard.py'                   = 'f08398d149c00303ef6025a4aa3ea8dd5aefb087a66081097ef6018ed59be293'
+    'winject/__init__.py'        = 'f25abb6cb808cdcde896f4980571bd33f15adf8c2faec6fa39ff178f9c7c8153'
+    'winject/common.py'          = 'e5fff1b3e34dd548a0b2eb35f0d62b05903669a8c2cf6034dbdbd36ac35afd9b'
+    'winject/control.py'         = 'e8efc0c21eae168f82f494dc19dedd8b64a93f0f4a88a7c2cda208adedf10eb5'
+    'winject/dispatcher.py'      = '5be755912842b6e641f01fee0ea3bb60be3ad3c812ee8bd72bc098a90723a478'
+    'winject/cli.py'             = 'c9794a89e4697b898f40342f1142ebe00aa1b0195d69d2489aaf6b6eac5d463c'
+    'winject/selftest.py'        = 'a5b6478500e3e8518e075343d173a177369cdfd12669b87b3a8d96d8685af94d'
+    'winject/targets.json'       = '8ce5199e9a662c2b1e878057bf4a0c246d5147b1add1c2f60b2730aa26717308'
+    'skills/winject/SKILL.md'    = 'f7a186a13b8f4165a4d1f7e1393a2fb09fc6cd11dd5014b913778f05cd06105a'
+    'skills/alarm-system/SKILL.md' = '93768832ac6e7934dec7a09b911ba568f8e7bfc7379827c534467169dc7b6cf7'
+    'skills/watchdog-alert/SKILL.md' = '9e581cee142485368943405746d44d29170c69cf87c93f9785af03d772b4f8e9'
 }
-$Skills = @('winsend', 'memory-rag')
+$Skills = @('winsend', 'memory-rag', 'winject', 'alarm-system', 'watchdog-alert')
 $script:PathAdded = @()
 $RootPreexisted = (Test-Path $Root) -and -not (Test-Path (Join-Path $Root '.agent'))   # the user's own C:\AI
 $script:McpPre = $false
@@ -141,6 +152,7 @@ Step '暫停舊的設定（重新安裝時避免互搶；裝完會自動重開�
     if ((Test-Path $Py) -and (Test-Path $Tgterm) -and (Test-Path $CfgPath)) { & $Py $Tgterm close-window | Out-Host; Start-Sleep -Seconds 2 }
     Stop-ByCommandLine '*run-agent.ps1*' 'old AI window'
     Stop-ByCommandLine '*tgterm.py*bridge*' 'old Telegram bridge'
+    Stop-ByCommandLine '*winject*dispatcher*' 'old winject dispatcher'
     Stop-ByCommandLine '*tg-bridge*bridge.py*' 'v1 Telegram bridge'
     Stop-ByCommandLine '*--remote-control agent-setup*' 'old setup session'
     $old = Join-Path ([Environment]::GetFolderPath('Startup')) 'agent-tg-bridge.vbs'
@@ -325,6 +337,8 @@ Step '輔助程式（Telegram 橋接、看門狗、LINE／視窗送字、說明�
     }
     & $Py $Tgterm selftest; Check 'tgterm selftest'
     & $Py (Join-Path $AgentDir 'winsend.py') selftest; Check 'winsend selftest'
+    & $Py (Join-Path $AgentDir 'guard.py') selftest; Check 'guard selftest'
+    & $Py (Join-Path $AgentDir 'winject\cli.py') selftest --dir $env:TEMP; Check 'winject selftest'
 }
 
 if ($tg) {
@@ -462,6 +476,16 @@ if ($ai -eq 'claude') {
     }
 }
 
+Step '安全防護（擋下刪光檔案、格式化、外洩密碼這類危險動作；主人在 Telegram 打 /allow 才放行一次）' {
+    & $Py (Join-Path $AgentDir 'guard.py') install $ai; Check 'guard install'
+    $marker = Join-Path $AgentDir 'codex-hook-trust'
+    if ($ai -eq 'codex') {
+        # Codex only runs hooks the user has reviewed; this flag lets the installed guard run (older Codex lacks it)
+        if (((& codex --help 2>&1) -join ' ') -match 'dangerously-bypass-hook-trust') { Write-Text $marker 'yes' }
+        elseif (Test-Path $marker) { Remove-Item $marker -Force }
+    }
+}
+
 # install record for the uninstaller: a program counts as ours if this run or an earlier run installed it
 $Now = & $Present
 $Ours = [ordered]@{}
@@ -551,6 +575,14 @@ $extraSections = @"
 ## 說明書（需要時才讀）
 - 傳 LINE 訊息、把文字送到其他視窗：先讀 C:\AI\.agent\skills\winsend\SKILL.md。只有 $userName 明確要求才做，發之前先複述對象和內容。
 - 進階記憶（L1～L6 分層）、整理記憶、RAG 語意搜尋：先讀 C:\AI\.agent\skills\memory-rag\SKILL.md。很花用量，只在 $userName 要求時做，平常不要主動建立。
+- 要從腳本、排程把文字排隊送進視窗或 LINE（多則依序送、失敗自動重試、看佇列狀態）：先讀 C:\AI\.agent\skills\winject\SKILL.md。單次傳一則用上面的 winsend 就好。
+- 要做比上面「提醒」更複雜的定時任務系統（多任務、確認回報、沒回就重催）：先讀 C:\AI\.agent\skillslarm-system\SKILL.md。只在 $userName 要求時建立。
+- 要監控某個程式有沒有掛掉、掛了用 Telegram 通知：先讀 C:\AI\.agent\skills\watchdog-alert\SKILL.md。只在 $userName 要求時建立。
+
+## 安全防護
+- 有一道安全防護會擋下危險動作（刪掉整個資料夾、格式化、強制推送 git、關機、下載後直接執行、讀密碼／登入憑證檔、新增 MCP 工具、關掉防護本身）。被擋時會看到「[安全防護] 已擋下」。
+- 被擋了：先停下來想有沒有更安全的做法；真的需要，就告訴 $userName 你要做什麼、為什麼$(if ($tg) { '（用 Telegram 傳）' })。$userName 在 Telegram 打 /allow 後，10 分鐘內重試一次就會放行，只放行一次。
+- 不要想辦法繞過防護（換寫法、改設定、自己建放行檔都不行）。
 
 ## 第一次見面
 - 如果 C:\AI\memory 裡還沒有「認識主人.md」：收到 [系統] 第一次見面的通知、或 $userName 第一次跟你說話時，先用你的個性打招呼、自我介紹（你的名字、能幫什麼、怎麼用 Telegram 和提醒），再一次問 3～5 個問題認識 $userName（工作、家人或重要的人、興趣、作息、最希望你幫什麼）。
@@ -623,7 +655,11 @@ while ($true) {
             if ($resume -and (Get-ChildItem (Join-Path $HOME '.claude\projects\C--AI') -Filter '*.jsonl' -ErrorAction SilentlyContinue)) { $a += '--continue' }
             & claude @a
         }
-        'codex'  { & codex --dangerously-bypass-approvals-and-sandbox }
+        'codex'  {
+            $a = @('--dangerously-bypass-approvals-and-sandbox')
+            if (Test-Path (Join-Path $agentDir 'codex-hook-trust')) { $a += '--dangerously-bypass-hook-trust' }
+            & codex @a
+        }
         'gemini' {
             $a = @('--dangerously-skip-permissions')
             if ($resume -and (Get-ChildItem (Join-Path $HOME '.gemini\antigravity-cli\conversations') -ErrorAction SilentlyContinue)) { $a += '--continue' }
@@ -678,7 +714,14 @@ $pil = (& $py -c "import PIL; print(PIL.__version__)" 2>&1) -join ''
 Result 'pillow (screenshots)' ($LASTEXITCODE -eq 0) $pil
 $ws = (& $py (Join-Path $agentDir 'winsend.py') selftest 2>&1) -join ' '
 Result 'winsend selftest' ($LASTEXITCODE -eq 0) $ws
-Result 'skills present' ((Test-Path (Join-Path $agentDir 'skills\winsend\SKILL.md')) -and (Test-Path (Join-Path $agentDir 'skills\memory-rag\SKILL.md'))) ''
+$gs = (& $py (Join-Path $agentDir 'guard.py') selftest 2>&1) -join ' '
+Result 'guard selftest' ($LASTEXITCODE -eq 0) $gs
+$hookCfg = switch ($ai) { 'claude' { Join-Path $HOME '.claude\settings.json' } 'codex' { Join-Path $HOME '.codex\hooks.json' } 'gemini' { Join-Path $HOME '.gemini\config\hooks.json' } }
+Result 'guard hooks registered' ((Test-Path $hookCfg) -and ((Get-Content $hookCfg -Raw -Encoding UTF8) -match 'guard\.py')) $hookCfg
+$wj = (& $py (Join-Path $agentDir 'winject\cli.py') selftest --dir $env:TEMP 2>&1) -join ' '
+Result 'winject selftest' ($LASTEXITCODE -eq 0) $wj
+$skillOk = @('winsend', 'memory-rag', 'winject', 'alarm-system', 'watchdog-alert' | Where-Object { -not (Test-Path (Join-Path $agentDir "skills\$_\SKILL.md")) }).Count -eq 0
+Result 'skills present' $skillOk ''
 Result 'install record' (Test-Path (Join-Path $agentDir 'installed.json')) ''
 if ($tg) {
     $null = & $py -c "import faster_whisper, imageio_ffmpeg" 2>&1
