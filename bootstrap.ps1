@@ -33,8 +33,8 @@ $CfgPath   = Join-Path $AgentDir 'config.json'
 $Paused    = Join-Path $AgentDir 'paused'
 $ClaudeDir = Join-Path $HOME '.claude'
 $TaskName  = 'agent-watchdog'
-$TgtermUrl    = 'https://raw.githubusercontent.com/dead1786/agent-setup/536cf19bff73b1df899655eaa264e8a64fc3afd6/tgterm.py'
-$TgtermSha256 = '66a85bea874e62af1c6f5a1ff8272b67f40e4f497ca761e73fa389dc1b85b0d9'
+$TgtermUrl    = 'https://raw.githubusercontent.com/dead1786/agent-setup/30dd69f52b57cb80a9fd08031efb194484505af0/tgterm.py'
+$TgtermSha256 = '2f139c58d25b15e5e0b6a9fdb973124615195b7ea9aba00a64fe36c1015fbb31'
 $McpTools  = 'Screenshot,Snapshot,DisplayInventory,ControlStatus,WaitFor,Wait,Clipboard,Click,Type,Scroll,Move,Shortcut,App'
 $Utf8      = New-Object Text.UTF8Encoding $false
 
