@@ -441,8 +441,11 @@ while ($true) {
     switch ('__AI__') {
         'claude' {
             $a = @('--dangerously-skip-permissions', '--name', $name)
+            # right after an install start a new conversation; after that, pick up where it left off
+            $fresh = Join-Path $agentDir 'fresh-start'
             $history = Join-Path $HOME '.claude\projects\C--AI'
-            if ($quick -eq 0 -and (Get-ChildItem $history -Filter '*.jsonl' -ErrorAction SilentlyContinue)) { $a += '--continue' }
+            if (Test-Path $fresh) { Remove-Item $fresh -Force }
+            elseif ($quick -eq 0 -and (Get-ChildItem $history -Filter '*.jsonl' -ErrorAction SilentlyContinue)) { $a += '--continue' }
             & claude @a
         }
         'codex'  { & codex --dangerously-bypass-approvals-and-sandbox }
@@ -456,22 +459,6 @@ while ($true) {
 '@
 $map = @{ '__NAME__' = $agentName; '__AGENTDIR__' = $AgentDir; '__ROOT__' = $Root; '__AI__' = $ai }
 Write-Text (Join-Path $AgentDir 'run-agent.ps1') (Fill $runAgent $map) -Bom
-
-Step '看門狗排程（每分鐘：AI 視窗被關掉就重開、Telegram 橋接停了就重啟）' {
-    schtasks.exe /Create /SC MINUTE /MO 1 /TN $TaskName /TR "$Pyw $Tgterm watchdog" /F | Out-Host
-    Check 'schtasks create'
-    try {
-        # laptops: keep running on battery
-        $svc = New-Object -ComObject Schedule.Service; $svc.Connect()
-        $folder = $svc.GetFolder('\')
-        $def = $folder.GetTask($TaskName).Definition
-        $def.Settings.DisallowStartIfOnBatteries = $false
-        $def.Settings.StopIfGoingOnBatteries = $false
-        $def.Settings.StartWhenAvailable = $true
-        $def.Settings.ExecutionTimeLimit = 'PT5M'
-        $null = $folder.RegisterTaskDefinition($TaskName, $def, 6, $null, $null, 3)
-    } catch { Say "    (battery settings not changed: $_)" 'Yellow' }
-}
 
 # ---------------------------------------------------------------- 7. verify + handoff (run by the setup session / at delivery)
 $verify = @'
@@ -653,12 +640,29 @@ if ($ai -eq 'codex') {
     }
 }
 
+# only now (signed in, everything written) may the AI window open and the watchdog start
 Step "開啟 AI 視窗「$agentName」" {
+    Set-Content -Path (Join-Path $AgentDir 'fresh-start') -Value 'install'
     Remove-Item $Paused, (Join-Path $AgentDir 'watchdog.lock') -Force -ErrorAction SilentlyContinue
     & $Py $Tgterm watchdog; Check 'watchdog'
     $ok = $false
     for ($i = 0; $i -lt 20 -and -not $ok; $i++) { Start-Sleep -Seconds 1; $ok = ((& $Py $Tgterm status | Out-String) -match 'agent_pid=\d+') }
     if ($ok) { Say '    已開啟' 'Green' } else { Say "    AI 視窗沒有開起來，請看 $AgentDir\watchdog.log" 'Yellow' }
+}
+Step '看門狗排程（每分鐘：AI 視窗被關掉就重開、Telegram 橋接停了就重啟）' {
+    schtasks.exe /Create /SC MINUTE /MO 1 /TN $TaskName /TR "$Pyw $Tgterm watchdog" /F | Out-Host
+    Check 'schtasks create'
+    try {
+        # laptops: keep running on battery
+        $svc = New-Object -ComObject Schedule.Service; $svc.Connect()
+        $folder = $svc.GetFolder('\')
+        $def = $folder.GetTask($TaskName).Definition
+        $def.Settings.DisallowStartIfOnBatteries = $false
+        $def.Settings.StopIfGoingOnBatteries = $false
+        $def.Settings.StartWhenAvailable = $true
+        $def.Settings.ExecutionTimeLimit = 'PT5M'
+        $null = $folder.RegisterTaskDefinition($TaskName, $def, 6, $null, $null, 3)
+    } catch { Say "    (battery settings not changed: $_)" 'Yellow' }
 }
 
 $prompt = @"
@@ -681,6 +685,9 @@ Say '  這個視窗會變成「安裝助理」，自動檢查並回報給遠端�
 if (-not $DryRun) {
     Stop-Transcript | Out-Null
     Set-Location $SetupDir
+    # a fixed title so this window is not mistaken for the AI window
+    $Host.UI.RawUI.WindowTitle = '安裝助理（裝完可關）'
+    $env:CLAUDE_CODE_DISABLE_TERMINAL_TITLE = '1'
     claude --dangerously-skip-permissions --remote-control agent-setup $prompt
 } else {
     Say ('[dry-run] would run: claude --dangerously-skip-permissions --remote-control agent-setup <prompt> (in ' + $SetupDir + ')') 'DarkGray'
