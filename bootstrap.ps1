@@ -70,6 +70,11 @@ function Download($url, $out) {
     Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
 }
 
+# ---------------------------------------------------------------- safety: real runs must be interactive
+if (-not $DryRun -and [Console]::IsInputRedirected) {
+    throw 'agent-setup must be run in an interactive PowerShell window (or set AGENT_SETUP_DRYRUN=1 for a dry run).'
+}
+
 # ---------------------------------------------------------------- 0. folders + log
 if (-not $DryRun) { New-Item -ItemType Directory -Force -Path $Root, $SetupDir, $ToolsDir, $BridgeDir, $MemDir, $UserBin | Out-Null }
 $LogPath = Join-Path $SetupDir ('bootstrap-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.log')
