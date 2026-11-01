@@ -560,7 +560,7 @@ $tgSection = if (-not $tg) { "## Telegram`n- 目前沒有接 Telegram。" } else
 - $userName 在 Telegram 也能用 /status /stop /restart /new /screen 遙控這個視窗，這些不會送到你這裡。
 "@ }
 $remindNotify = if ($tg) { '，做完用 Telegram 告訴' + $userName } else { '' }
-$greetTg = if ($tg) { '有接 Telegram，所以也用 tgterm send 傳一句打招呼。' } else { '' }
+$greetTg = if ($tg) { "`n- 有接 Telegram：$userName 多半在手機上，看不到這個視窗。所以上面的自我介紹和問題要完整用 Telegram 傳一份（多行內容先寫進 UTF-8 文字檔，再用 tgterm send --text-file 傳），不要只傳一句招呼；$userName 從 Telegram 或這個視窗回答都算。" } else { '' }
 $extraSections = @"
 ## 提醒與排程
 - [提醒] 開頭的訊息是排好的時間到了：照內容去做（提醒 $userName、整理晨報…）$remindNotify。
