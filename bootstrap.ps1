@@ -683,12 +683,21 @@ if ($status -match '"loggedIn"\s*:\s*true') {
     exit 1
 }
 if ('__AI__' -eq 'claude') {
-    # the AI window still holds the installer's sign-in in memory: restart it so it asks for the owner's own account
+    # the AI window still holds the installer's sign-in in memory: restart it, then type /login into it
+    # so the owner goes straight to the web page and signs in with their own account (Codex / agy keep their own sign-in)
     & $py $tgterm close-window | Out-Null
     Start-Sleep -Seconds 3
     Remove-Item (Join-Path '__AGENTDIR__' 'watchdog.lock') -Force -ErrorAction SilentlyContinue
     & $py $tgterm watchdog
-    Write-Host 'AI 視窗已重新開啟：請在那個視窗用「你自己的」Claude 帳號登入。' -ForegroundColor Yellow
+    $up = $false
+    for ($i = 0; $i -lt 30 -and -not $up; $i++) { Start-Sleep -Seconds 1; $up = ((& $py $tgterm status | Out-String) -match 'agent_pid=\d+') }
+    Start-Sleep -Seconds 12   # let Claude Code finish starting before typing into it
+    $typed = (& $py $tgterm inject '/login' | Out-String).Trim()
+    if ($typed -like 'ok*') {
+        Write-Host 'AI 視窗已重新開啟，並自動輸入了 /login：請在那個視窗選用 Claude 帳號登入，瀏覽器會打開，用「你自己的」帳號登入並授權。' -ForegroundColor Yellow
+    } else {
+        Write-Host ('AI 視窗已重新開啟，但沒能自動輸入（' + $typed + '）：請在那個視窗自己輸入 /login 再按 Enter，用「你自己的」Claude 帳號登入。') -ForegroundColor Yellow
+    }
 }
 Write-Host ''
 Write-Host '✅ 已登出安裝者的 Claude 帳號（已確認），可以關閉這個視窗了。' -ForegroundColor Green
