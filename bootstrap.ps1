@@ -35,8 +35,8 @@ $ClaudeDir = Join-Path $HOME '.claude'
 $TaskName  = 'agent-watchdog'
 # the remote helper's Claude session (same account) that receives the setup report; it renames itself to this with /rename
 $Coordinator = if ($env:AGENT_SETUP_COORDINATOR) { $env:AGENT_SETUP_COORDINATOR } else { 'agent-coordinator' }
-$TgtermUrl    = 'https://raw.githubusercontent.com/dead1786/agent-setup/30dd69f52b57cb80a9fd08031efb194484505af0/tgterm.py'
-$TgtermSha256 = '2f139c58d25b15e5e0b6a9fdb973124615195b7ea9aba00a64fe36c1015fbb31'
+$TgtermUrl    = 'https://raw.githubusercontent.com/dead1786/agent-setup/12ad5bf708df4fde4180fcb2e6d621dbbc07b5f6/tgterm.py'
+$TgtermSha256 = 'a86feb2e0b1b99229c7e3a5a0db447dd928d3334ebe0fde84e7aa09888983cbe'
 $McpTools  = 'Screenshot,Snapshot,DisplayInventory,ControlStatus,WaitFor,Wait,Clipboard,Click,Type,Scroll,Move,Shortcut,App'
 $Utf8      = New-Object Text.UTF8Encoding $false
 
@@ -227,10 +227,43 @@ Step 'uv（Python 工具）' {
     & $UvExe --version; Check 'uv'
 }
 
-Step 'Python（給 Telegram 橋接與看門狗用）' {
+# sign-in hook: Claude runs $env:BROWSER with the sign-in link; this exe sends it out as a QR code instead of opening
+# a browser here, so the installer signs in on their own phone and this computer's browser never holds their session
+$HookDir   = Join-Path $AgentDir 'login-hook'
+$LoginHook = Join-Path $PyDir 'Scripts\agent-login-url.exe'
+Write-Text (Join-Path $HookDir 'pyproject.toml') @'
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-login-hook"
+version = "1.0.0"
+
+[project.scripts]
+agent-login-url = "agent_login_hook:main"
+
+[tool.setuptools]
+py-modules = ["agent_login_hook"]
+'@
+Write-Text (Join-Path $HookDir 'agent_login_hook.py') @'
+# BROWSER hook for `claude auth login`: hands the sign-in link to tgterm.py instead of opening a browser here
+import runpy, sys
+
+TGTERM = r"C:\AI\.agent\tgterm.py"
+
+
+def main():
+    sys.argv = [TGTERM, "login-url"] + sys.argv[1:]
+    runpy.run_path(TGTERM, run_name="__main__")
+'@
+
+Step 'Python（給 Telegram 橋接、看門狗、登入 QR code 用）' {
     if (-not (Test-Path $Py)) { & $UvExe venv --python 3.12 $PyDir; Check 'uv venv' }
     if (-not (Test-Path $Pyw)) { throw "pythonw.exe missing in $PyDir" }
     & $Py --version; Check 'python'
+    & $UvExe pip install --python $Py --reinstall-package agent-login-hook segno $HookDir; Check 'uv pip install'
+    if (-not (Test-Path $LoginHook)) { throw "sign-in hook missing: $LoginHook" }
 }
 
 Step 'tgterm（Telegram 送字橋接＋看門狗）' {
@@ -675,9 +708,15 @@ Write-Text $FinishPath $finish -Bom
 
 # ---------------------------------------------------------------- 8. sign-ins, open the AI window, hand over to the setup session
 Say ''
-Step 'Claude 登入（安裝用帳號）' {
+Step 'Claude 登入（安裝用帳號，用安裝人員自己的手機授權）' {
     $st = cmd /c "claude auth status 2>nul" | Out-String
-    if ($st -match '"loggedIn"\s*:\s*true') { Say '    已登入' 'Green' } else { claude auth login --claudeai; Check 'claude auth login' }
+    if ($st -match '"loggedIn"\s*:\s*true') { Say '    已登入' 'Green'; return }
+    if ($tg) { Say "    登入連結會用 Telegram（@$botName）傳一張 QR code 給你：請交給安裝人員，用他自己的手機掃描並按「授權」。" 'Yellow' }
+    else { Say '    會跳出一個視窗顯示 QR code：請安裝人員用他自己的手機掃描並按「授權」。' 'Yellow' }
+    Say '    授權後網頁會顯示一串代碼：把代碼貼到下面「Paste code here if prompted」那一行，按 Enter。' 'Yellow'
+    $env:BROWSER = $LoginHook
+    try { claude auth login --claudeai; Check 'claude auth login' }
+    finally { Remove-Item Env:BROWSER -ErrorAction SilentlyContinue }
 }
 if ($ai -eq 'codex') {
     Step 'Codex 登入（用你自己的 ChatGPT 帳號）' {
