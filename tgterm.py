@@ -647,9 +647,11 @@ def command(cfg, name):
         with open(ALLOW, "w", encoding="utf-8") as f:
             f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
         what = last_blocked()
-        send(cfg, "已放行：AI 在 10 分鐘內可以做「一次」剛才被安全防護擋下的動作。" +
+        send(cfg, "已放行：AI 在 10 分鐘內可以做「一次」剛才被安全防護擋下的動作，它會馬上重試。" +
              ("\n最近一次被擋的是：%s" % what if what else "") +
              "\n不確定它要做什麼的話，先問清楚再放行。")
+        deliver(cfg, "主人打了 /allow：同意放行剛才被安全防護擋下的那個動作（只放行一次，10 分鐘內有效）。"
+                     "請現在重試那個動作，做完回報結果。")
     else:
         send(cfg, "直接傳訊息就是跟 AI 說話；圖片、檔案、影片、語音都可以傳。\n" +
              "\n".join("/%s  %s" % c for c in COMMANDS) +
