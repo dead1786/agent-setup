@@ -35,8 +35,18 @@ $ClaudeDir = Join-Path $HOME '.claude'
 $TaskName  = 'agent-watchdog'
 # the remote helper's Claude session (same account) that receives the setup report; it renames itself to this with /rename
 $Coordinator = if ($env:AGENT_SETUP_COORDINATOR) { $env:AGENT_SETUP_COORDINATOR } else { 'agent-coordinator' }
-$TgtermUrl    = 'https://raw.githubusercontent.com/dead1786/agent-setup/0dc23e399df8535d02738f64a0091bc307e9887d/tgterm.py'
-$TgtermSha256 = 'ecb9ffd5c6f2a474adbce39f1f6ed75e0d6953ffa2ef71cd067f3016b6d10f69'
+# helper files, pinned to one commit and checked by SHA-256 (a CDN cache can never hand out another version)
+$PinCommit = 'f22f22e7f130314dc13efd31d3483f44da9e3a34'
+$PinFiles  = [ordered]@{
+    'tgterm.py'                  = '5a2bd7415e9218cfa5f1a80fbaf262146410dfb38cd1294b01413a2c7e3274fe'
+    'winsend.py'                 = '0089b099a5196819cb891a6339dc03508f23204743adaff4517979e8295e5fa1'
+    'skills/winsend/SKILL.md'    = '1f52e2fc29145ab7fa1ca4ac1a39eac9910b5b49306cce2716e452ffd7ada891'
+    'skills/memory-rag/SKILL.md' = '21a521973b965eb624b0a1853e01299aefadbc1a2d793ca3bd3ac8cd6fb0de55'
+}
+$Skills = @('winsend', 'memory-rag')
+$script:PathAdded = @()
+$RootPreexisted = (Test-Path $Root) -and -not (Test-Path (Join-Path $Root '.agent'))   # the user's own C:\AI
+$script:McpPre = $false
 $McpTools  = 'Screenshot,Snapshot,DisplayInventory,ControlStatus,WaitFor,Wait,Clipboard,Click,Type,Scroll,Move,Shortcut,App'
 $Utf8      = New-Object Text.UTF8Encoding $false
 
@@ -66,6 +76,7 @@ function Add-UserPath($dir) {
     if (-not $cur) { $cur = '' }
     if (($cur -split ';') -notcontains $dir) {
         if (-not $DryRun) { [Environment]::SetEnvironmentVariable('Path', ($cur.TrimEnd(';') + ';' + $dir).TrimStart(';'), 'User') }
+        $script:PathAdded += $dir                       # recorded for the uninstaller
         Say "    PATH += $dir" 'DarkGray'
     }
     if (($env:Path -split ';') -notcontains $dir) { $env:Path = "$env:Path;$dir" }
@@ -241,6 +252,20 @@ if (-not $DryRun) {
 # ---------------------------------------------------------------- 2. tools (user-level, no admin)
 # always call the uv in ~/.local/bin by full path (an older uv elsewhere on PATH may be too old)
 $UvExe = Join-Path $LocalBin 'uv.exe'
+# what is already here before this run: the uninstaller removes only programs this installer added
+$PrevMan = Read-JsonObject (Join-Path $AgentDir 'installed.json')
+$Present = {
+    [ordered]@{
+        uv     = (Test-Path $UvExe)
+        git    = (Test-Path (Join-Path $GitDir 'cmd\git.exe'))
+        jq     = (Test-Path (Join-Path $UserBin 'jq.exe'))
+        claude = ((Have 'claude') -or (Test-Path (Join-Path $LocalBin 'claude.exe')))
+        node   = (Test-Path (Join-Path $NodeDir 'node.exe'))
+        codex  = (Have 'codex')
+        agy    = (Have 'agy')
+    }
+}
+$Pre = & $Present
 Step 'uv（Python 工具）' {
     if (-not (Test-Path $UvExe)) { Invoke-RestMethod https://astral.sh/uv/install.ps1 | Invoke-Expression }
     Add-UserPath $LocalBin
@@ -281,21 +306,25 @@ def main():
     runpy.run_path(TGTERM, run_name="__main__")
 '@
 
-Step 'Python（給 Telegram 橋接、看門狗、登入 QR code 用）' {
+Step 'Python（Telegram 橋接、看門狗、登入 QR code、螢幕截圖用）' {
     if (-not (Test-Path $Py)) { & $UvExe venv --python 3.12 $PyDir; Check 'uv venv' }
     if (-not (Test-Path $Pyw)) { throw "pythonw.exe missing in $PyDir" }
     & $Py --version; Check 'python'
-    & $UvExe pip install --python $Py --reinstall-package agent-login-hook segno $HookDir; Check 'uv pip install'
+    & $UvExe pip install --python $Py --reinstall-package agent-login-hook segno pillow $HookDir; Check 'uv pip install'
     if (-not (Test-Path $LoginHook)) { throw "sign-in hook missing: $LoginHook" }
 }
 
-Step 'tgterm（Telegram 送字橋接＋看門狗）' {
-    $tmp = $Tgterm + '.download'
-    Download $TgtermUrl $tmp
-    $hash = (Get-FileHash $tmp -Algorithm SHA256).Hash.ToLower()
-    if ($hash -ne $TgtermSha256) { Remove-Item $tmp -Force; throw "tgterm.py checksum mismatch: $hash" }
-    Move-Item $tmp $Tgterm -Force
+Step '輔助程式（Telegram 橋接、看門狗、LINE／視窗送字、說明書）' {
+    foreach ($rel in $PinFiles.Keys) {
+        $dest = Join-Path $AgentDir ($rel -replace '/', '\')
+        $tmp = $dest + '.download'
+        Download "https://raw.githubusercontent.com/dead1786/agent-setup/$PinCommit/$rel" $tmp
+        $hash = (Get-FileHash $tmp -Algorithm SHA256).Hash.ToLower()
+        if ($hash -ne $PinFiles[$rel]) { Remove-Item $tmp -Force; throw "$rel checksum mismatch: $hash" }
+        Move-Item $tmp $dest -Force
+    }
     & $Py $Tgterm selftest; Check 'tgterm selftest'
+    & $Py (Join-Path $AgentDir 'winsend.py') selftest; Check 'winsend selftest'
 }
 
 Step 'Git（PortableGit）' {
@@ -376,6 +405,10 @@ Step 'Windows-MCP（CursorTouch，只開 13 個低風險工具）' {
 if ($NeedClaude) {
     Step 'Windows-MCP 接到 Claude Code' {
         $listed = (cmd /c "claude mcp list 2>&1" | Out-String)
+        if ($listed -match 'windows-mcp' -and $listed -notmatch [regex]::Escape($McpDir)) {
+            # the user already has their own windows-mcp: leave it alone (the uninstaller will too)
+            $script:McpPre = $true; Say '    已有自己的 windows-mcp，保留不動' 'DarkGray'; return
+        }
         if ($listed -match 'windows-mcp') { cmd /c "claude mcp remove windows-mcp --scope user >nul 2>&1" }
         claude mcp add windows-mcp --scope user --transport stdio --env ANONYMIZED_TELEMETRY=false -- $UvExe @McpArgs; Check 'claude mcp add'
     }
@@ -409,9 +442,31 @@ if ($ai -eq 'gemini') {
     }
 }
 
+if ($ai -eq 'claude') {
+    Step 'Claude 說明書（skills：LINE／視窗送字、進階記憶與 RAG）' {
+        foreach ($s in $Skills) {
+            $dst = Join-Path $ClaudeDir "skills\$s"
+            New-Item -ItemType Directory -Force -Path $dst | Out-Null
+            Copy-Item (Join-Path $AgentDir "skills\$s\SKILL.md") (Join-Path $dst 'SKILL.md') -Force
+        }
+    }
+}
+
+# install record for the uninstaller: a program counts as ours if this run or an earlier run installed it
+$Now = & $Present
+$Ours = [ordered]@{}
+foreach ($k in $Pre.Keys) { $Ours[$k] = [bool](($PrevMan -and $PrevMan.ours -and $PrevMan.ours.$k) -or ((-not $Pre[$k]) -and $Now[$k])) }
+$prevPaths = if ($PrevMan -and $PrevMan.path_added) { @($PrevMan.path_added) } else { @() }
+$pathAdded = @($prevPaths + $script:PathAdded | Where-Object { $_ } | Select-Object -Unique)
+$rootPre = [bool](($PrevMan -and $PrevMan.root_preexisted) -or $RootPreexisted)
+$mcpPre = [bool](($PrevMan -and $PrevMan.mcp_preexisting) -or $script:McpPre)
+Write-Text (Join-Path $AgentDir 'installed.json') ([ordered]@{ ours = $Ours; path_added = $pathAdded; ai = $ai; remote = $remote
+    root_preexisted = $rootPre; mcp_preexisting = $mcpPre
+    updated = (Get-Date).ToString('s') } | ConvertTo-Json -Depth 5)
+
 # ---------------------------------------------------------------- 4. Claude settings (setup phase) + status line
 $BashExe = (Join-Path $GitDir 'bin\bash.exe') -replace '\\', '/'
-$StatusScript = Join-Path $ClaudeDir 'statusline-command.sh'
+$StatusScript = Join-Path $ClaudeDir 'agent-setup-statusline.sh'
 if ($NeedClaude) {
     Step $(if ($remote) { 'Claude 設定（安裝期間：免確認、接收協調訊息、略過首次導覽、信任工作資料夾）' } else { 'Claude 設定（略過首次導覽、信任工作資料夾）' }) {
         $patch = [ordered]@{
@@ -461,12 +516,36 @@ $tgSection = if (-not $tg) { "## Telegram`n- 目前沒有接 Telegram。" } else
 - 開頭是 [TG] 的訊息，是 $userName 從 Telegram 傳來的，$userName 看不到這個視窗。處理完一定要用下面的指令把回覆傳回 Telegram，不然收不到：
   - PowerShell／cmd：``C:\AI\.agent\py\Scripts\python.exe C:\AI\.agent\tgterm.py send "回覆內容"``
   - Git Bash：``/c/AI/.agent/py/Scripts/python.exe C:/AI/.agent/tgterm.py send "回覆內容"``
-- 回覆有多行或含雙引號時：先把內容寫進 UTF-8 文字檔，再用 ``send --file 檔案路徑``。
+  - 以下說的「tgterm」都是指上面那一整串指令。
+- 回覆有多行或含雙引號時：先把內容寫進 UTF-8 文字檔，再用 ``tgterm send --text-file 檔案路徑``。
+- 傳圖片／檔案／影片給 $userName：``tgterm send --photo 路徑 說明``、``tgterm send --doc 路徑 說明``、``tgterm send --video 路徑 說明``（單檔上限 50MB、圖片 10MB）。
+- $userName 傳來的東西會帶標籤，後面是已經存好的檔案路徑：[圖片] [檔案] [影片] [動圖] [語音] [音訊] [貼圖]。圖片你可以直接看；[語音] 會附上轉好的文字；影片和音訊你看不到內容，只能當檔案處理。
 - 要做比較久的事，先傳一句「收到，處理中」，做完再傳結果。
-- 訊息裡寫「主人傳了一張圖片／一個檔案，存在 路徑」時，檔案已經存好，直接讀那個路徑。
 - 沒有 [TG] 開頭的訊息，是 $userName 在電腦前打字，直接在這裡回覆就好。
 - 這個指令只會傳給 $userName 本人；不要用任何方式替 $userName 對外發訊息。
+- $userName 在 Telegram 也能用 /status /stop /restart /new /screen 遙控這個視窗，這些不會送到你這裡。
 "@ }
+$remindNotify = if ($tg) { '，做完用 Telegram 告訴' + $userName } else { '' }
+$greetTg = if ($tg) { '有接 Telegram，所以也用 tgterm send 傳一句打招呼。' } else { '' }
+$extraSections = @"
+## 提醒與排程
+- [提醒] 開頭的訊息是排好的時間到了：照內容去做（提醒 $userName、整理晨報…）$remindNotify。
+- $userName 說「幾點提醒我…」「每天早上…」時，用這些指令建立（不用另外開排程，指令就是 ``C:\AI\.agent\py\Scripts\python.exe C:\AI\.agent\tgterm.py remind ...``）：
+  - 每天：``remind add --daily 08:00 "內容"``
+  - 每週：``remind add --weekly 1,3,5 08:00 "內容"``（1＝週一 … 7＝週日）
+  - 一次：``remind add --once "2026-11-02 15:00" "內容"``，或 ``remind add --in 30 "內容"``（30 分鐘後）
+  - 查看／刪除：``remind list``、``remind del r1``
+- 「內容」是寫給未來的自己看的：寫清楚到時要做什麼、要不要通知 $userName。
+- 電腦關機時錯過的提醒，開機後 6 小時內會補發。
+
+## 說明書（需要時才讀）
+- 傳 LINE 訊息、把文字送到其他視窗：先讀 C:\AI\.agent\skills\winsend\SKILL.md。只有 $userName 明確要求才做，發之前先複述對象和內容。
+- 進階記憶（L1～L6 分層）、整理記憶、RAG 語意搜尋：先讀 C:\AI\.agent\skills\memory-rag\SKILL.md。很花用量，只在 $userName 要求時做，平常不要主動建立。
+
+## 第一次見面
+- 如果 C:\AI\memory 裡還沒有「認識主人.md」：收到 [系統] 第一次見面的通知、或 $userName 第一次跟你說話時，先用你的個性打招呼、自我介紹（你的名字、能幫什麼、怎麼用 Telegram 和提醒），再一次問 3～5 個問題認識 $userName（工作、家人或重要的人、興趣、作息、最希望你幫什麼）。
+- 把回答整理寫進 C:\AI\memory\認識主人.md，並在 MEMORY.md 加一行索引。$greetTg
+"@
 $rules = @"
 # $agentName
 
@@ -493,6 +572,8 @@ $workLine
 - 已接 Windows-MCP：可以看螢幕、截圖、點擊、打字、捲動、切換視窗、讀寫剪貼簿。
 
 $tgSection
+
+$extraSections
 "@
 if (-not $DryRun -and (Test-Path $RulesPath) -and ([IO.File]::ReadAllText($RulesPath) -ne $rules)) {
     Copy-Item $RulesPath ($RulesPath + '.bak-' + (Get-Date).ToString('yyyyMMddHHmmss')) -Force
@@ -502,7 +583,8 @@ if ($DryRun -or -not (Test-Path (Join-Path $MemDir 'MEMORY.md'))) { Write-Text (
 
 # ---------------------------------------------------------------- 6. tgterm config, the agent window, the watchdog
 $mode = if ($prevCfg -and $prevCfg.mode) { [string]$prevCfg.mode } else { 'console' }
-$cfg = [ordered]@{ agent_name = $agentName; ai = $ai; root = $Root; token = $tgToken; owner_id = $ownerId; bot = $botName; prefix = '[TG] '; mode = $mode }
+$cfg = [ordered]@{ agent_name = $agentName; ai = $ai; root = $Root; token = $tgToken; owner_id = $ownerId; bot = $botName; prefix = '[TG] '; mode = $mode
+    uv = $UvExe }
 Write-Text $CfgPath ($cfg | ConvertTo-Json)
 if ($null -ne $tgBase) { Write-Text (Join-Path $AgentDir 'tgterm-state.json') ((@{ offset = $tgBase }) | ConvertTo-Json) }
 
@@ -582,6 +664,12 @@ foreach ($c in $tools) {
     Result ('tool ' + $c) ($code -eq 0) $v
 }
 Write-Output ('python: ' + ((& $py --version 2>&1) -join ''))
+$pil = (& $py -c "import PIL; print(PIL.__version__)" 2>&1) -join ''
+Result 'pillow (screenshots)' ($LASTEXITCODE -eq 0) $pil
+$ws = (& $py (Join-Path $agentDir 'winsend.py') selftest 2>&1) -join ' '
+Result 'winsend selftest' ($LASTEXITCODE -eq 0) $ws
+Result 'skills present' ((Test-Path (Join-Path $agentDir 'skills\winsend\SKILL.md')) -and (Test-Path (Join-Path $agentDir 'skills\memory-rag\SKILL.md'))) ''
+Result 'install record' (Test-Path (Join-Path $agentDir 'installed.json')) ''
 
 Section 'windows-mcp'
 git -C '__MCPDIR__' log -1 --oneline
@@ -719,6 +807,8 @@ if ($status -match '"loggedIn"\s*:\s*true') {
 }
 # signed out: the watchdog's safety net is no longer needed
 Remove-Item (Join-Path '__AGENTDIR__' 'handoff-pending') -Force -ErrorAction SilentlyContinue
+# Codex / Antigravity keep the owner's own sign-in: say hello now (a Claude AI does it after the owner signs in)
+if ('__AI__' -ne 'claude') { & $py $tgterm inject '__KICK__' | Out-Null }
 if ('__AI__' -eq 'claude') {
     # the AI window still holds the installer's sign-in in memory: restart it, then type /login into it
     # so the owner goes straight to the web page and signs in with their own account (Codex / agy keep their own sign-in)
@@ -741,7 +831,8 @@ Write-Host '✅ 已登出安裝者的 Claude 帳號（已確認），可以關�
 Write-Host '   AI 助理安裝 by Kai' -ForegroundColor DarkGray
 '@
 $HandoffPath = Join-Path $SetupDir 'handoff.ps1'
-if ($remote) { Write-Text $HandoffPath (Fill $handoff @{ '__PY__' = $Py; '__TGTERM__' = $Tgterm; '__AI__' = $ai; '__AGENTDIR__' = $AgentDir }) -Bom }
+$Kick = '[系統] 安裝完成了。這是你第一次見到主人：請照規則檔「第一次見面」那一段做。'
+if ($remote) { Write-Text $HandoffPath (Fill $handoff @{ '__PY__' = $Py; '__TGTERM__' = $Tgterm; '__AI__' = $ai; '__AGENTDIR__' = $AgentDir; '__KICK__' = $Kick }) -Bom }
 
 $finish = @'
 # Ends the setup assistant (the Claude session started with --remote-control agent-setup).
@@ -855,6 +946,8 @@ if ($DryRun) {
     # no remote help: check right here, nothing leaves this computer
     $Host.UI.RawUI.WindowTitle = '安裝檢查中'
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $VerifyPath
+    Start-Sleep -Seconds 15                            # verify just reopened the AI window: let it finish starting
+    & $Py $Tgterm inject $Kick | Out-Null              # first meeting: the AI introduces itself now
     Stop-Transcript | Out-Null
     $Host.UI.RawUI.WindowTitle = '安裝完成（可關閉）'
     Say ''
