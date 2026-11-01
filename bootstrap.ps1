@@ -119,8 +119,17 @@ Step 'uv' {
         Invoke-RestMethod https://astral.sh/uv/install.ps1 | Invoke-Expression
     }
     Add-UserPath $LocalBin
+    # an old uv cannot download newer Pythons (Windows-MCP needs >=3.14); update it, or reinstall if self-update is unavailable
+    $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    uv self update 2>&1 | Out-Host
+    $selfUpdateFailed = ($LASTEXITCODE -ne 0)
+    $ErrorActionPreference = $prevEap
+    if ($selfUpdateFailed) { Invoke-RestMethod https://astral.sh/uv/install.ps1 | Invoke-Expression }
     uv --version; Check 'uv'
 }
+
+# always call the uv we installed/updated (an older uv elsewhere on PATH may not support Python 3.14)
+$UvExe = if (Test-Path (Join-Path $LocalBin 'uv.exe')) { Join-Path $LocalBin 'uv.exe' } else { 'uv' }
 
 Step 'Git (PortableGit, no admin)' {
     $gitExe = Join-Path $GitDir 'cmd\git.exe'
@@ -188,13 +197,13 @@ $McpArgs = @('--directory', $McpDir, 'run', 'windows-mcp', 'serve', '--tools', $
 Step 'Windows-MCP（CursorTouch，低風險 13 工具）' {
     $gitExe = Join-Path $GitDir 'cmd\git.exe'
     if (-not (Test-Path (Join-Path $McpDir '.git'))) { & $gitExe clone --depth 1 https://github.com/CursorTouch/Windows-MCP.git $McpDir; Check 'git clone windows-mcp' }
-    uv --directory $McpDir sync; Check 'uv sync windows-mcp'
+    & $UvExe --directory $McpDir sync; Check 'uv sync windows-mcp'
 }
 
 Step "Windows-MCP 註冊到 Claude Code" {
     $listed = (& claude mcp list | Out-String)
     if ($listed -match 'windows-mcp') { & claude mcp remove windows-mcp --scope user | Out-Null }
-    claude mcp add windows-mcp --scope user --transport stdio --env ANONYMIZED_TELEMETRY=false -- uv @McpArgs; Check 'claude mcp add'
+    claude mcp add windows-mcp --scope user --transport stdio --env ANONYMIZED_TELEMETRY=false -- $UvExe @McpArgs; Check 'claude mcp add'
 }
 
 if ($ai -eq 'codex') {
@@ -203,7 +212,8 @@ if ($ai -eq 'codex') {
         $old = if (Test-Path $cfg) { Get-Content $cfg -Raw } else { '' }
         if ($old -notmatch '\[mcp_servers\.windows-mcp\]') {
             $argsToml = ($McpArgs | ForEach-Object { '"' + ($_ -replace '\\', '\\') + '"' }) -join ', '
-            $block = "`n[mcp_servers.windows-mcp]`ncommand = `"uv`"`nargs = [$argsToml]`nenv = { ANONYMIZED_TELEMETRY = `"false`" }`n"
+            $uvToml = $UvExe -replace '\\', '\\'
+            $block = "`n[mcp_servers.windows-mcp]`ncommand = `"$uvToml`"`nargs = [$argsToml]`nenv = { ANONYMIZED_TELEMETRY = `"false`" }`n"
             Write-Text $cfg ($old + $block)
         }
     }
@@ -213,7 +223,7 @@ if ($ai -eq 'gemini') {
         $cfg = Join-Path $HOME '.gemini\settings.json'
         $obj = Read-JsonObject $cfg
         Ensure-ObjProp $obj 'mcpServers'
-        $srv = [ordered]@{ command = 'uv'; args = $McpArgs; env = @{ ANONYMIZED_TELEMETRY = 'false' } }
+        $srv = [ordered]@{ command = $UvExe; args = $McpArgs; env = @{ ANONYMIZED_TELEMETRY = 'false' } }
         $obj.mcpServers | Add-Member -NotePropertyName 'windows-mcp' -NotePropertyValue $srv -Force
         Write-Text $cfg ($obj | ConvertTo-Json -Depth 20)
     }
