@@ -341,6 +341,8 @@ Step 'Claude 設定（安裝期間：免確認、接收協調訊息、略過首�
     Merge-Json (Join-Path $ClaudeDir 'settings.json') ([ordered]@{
         crossSessionInbound = 'accept'
         skipDangerousModePermissionPrompt = $true
+        # while the installer's account is signed in, its claude.ai connectors (Gmail, Drive, Calendar...) must not reach this machine
+        disableClaudeAiConnectors = $true
         permissions = @{ defaultMode = 'bypassPermissions' }
         statusLine = [ordered]@{ type = 'command'; command = "`"$BashExe`" `"" + ($StatusScript -replace '\\', '/') + '"' }
     })
@@ -497,7 +499,11 @@ Write-Output ('python: ' + ((& $py --version 2>&1) -join ''))
 Section 'windows-mcp'
 git -C '__MCPDIR__' log -1 --oneline
 switch ($ai) {
-    'claude' { $reg = (claude mcp list 2>&1 | Out-String); Write-Output $reg; Result 'windows-mcp connected' ($reg -match 'windows-mcp.*Connected') 'claude mcp list' }
+    'claude' {
+        $reg = (claude mcp list 2>&1 | Out-String); Write-Output $reg
+        Result 'windows-mcp connected' ($reg -match 'windows-mcp.*Connected') 'claude mcp list'
+        Result 'claude.ai connectors off' ($reg -notmatch 'claude\.ai ') 'no Gmail/Drive/Calendar of the installer account'
+    }
     'codex'  { $reg = Get-Content (Join-Path $HOME '.codex\config.toml') -Raw -Encoding UTF8; Result 'windows-mcp registered' ($reg -match 'mcp_servers\.windows-mcp') 'codex config.toml' }
     'gemini' { $reg = Get-Content (Join-Path $HOME '.gemini\settings.json') -Raw -Encoding UTF8; Result 'windows-mcp registered' ($reg -match 'windows-mcp') 'gemini settings.json' }
 }
@@ -612,7 +618,7 @@ $env:Path = [Environment]::GetEnvironmentVariable('Path', 'User') + ';' + [Envir
 $env:PYTHONUTF8 = '1'
 $py = '__PY__'; $tgterm = '__TGTERM__'
 $patch = Join-Path $env:TEMP 'agent-handoff-patch.json'
-[IO.File]::WriteAllText($patch, '{"crossSessionInbound": null, "permissions": {"defaultMode": null}}', (New-Object Text.UTF8Encoding $false))
+[IO.File]::WriteAllText($patch, '{"crossSessionInbound": null, "disableClaudeAiConnectors": null, "permissions": {"defaultMode": null}}', (New-Object Text.UTF8Encoding $false))
 & $py $tgterm merge-json (Join-Path $HOME '.claude\settings.json') $patch
 Remove-Item $patch -Force
 claude auth logout
