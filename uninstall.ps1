@@ -151,6 +151,7 @@ if ($rootPre) {
 }
 Remove-Path $SetupDir
 Remove-Path (Join-Path ([Environment]::GetFolderPath('Startup')) 'agent-tg-bridge.vbs')
+Remove-Path (Join-Path $HOME '.cache\huggingface\hub\models--Systran--faster-whisper-small')   # the voice model (~500MB)
 if ($drop.uv) {                                         # last: nothing above needs uv any more
     foreach ($x in 'uv.exe', 'uvx.exe', 'uvw.exe') { Remove-Path (Join-Path $LocalBin $x) }
     Remove-Path (Join-Path $env:APPDATA 'uv')

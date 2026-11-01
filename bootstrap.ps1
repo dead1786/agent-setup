@@ -327,6 +327,16 @@ Step '輔助程式（Telegram 橋接、看門狗、LINE／視窗送字、說明�
     & $Py (Join-Path $AgentDir 'winsend.py') selftest; Check 'winsend selftest'
 }
 
+if ($tg) {
+    # Telegram voice / video: set up now so the first voice message is fast (otherwise done on first use)
+    Step '語音辨識＋影片處理（給 Telegram 用；約下載 500MB，需要幾分鐘）' {
+        & $UvExe pip install --python $Py faster-whisper imageio-ffmpeg
+        if ($LASTEXITCODE -ne 0) { Say '    (沒裝成功：第一次收到語音或影片時會再自動安裝)' 'Yellow'; return }
+        & $Py -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8'); print('voice model ready')"
+        if ($LASTEXITCODE -ne 0) { Say '    (語音模型沒下載成功：第一次收到語音時會再自動下載)' 'Yellow' }
+    }
+}
+
 Step 'Git（PortableGit）' {
     $gitExe = Join-Path $GitDir 'cmd\git.exe'
     if (-not (Test-Path $gitExe)) {
@@ -670,6 +680,10 @@ $ws = (& $py (Join-Path $agentDir 'winsend.py') selftest 2>&1) -join ' '
 Result 'winsend selftest' ($LASTEXITCODE -eq 0) $ws
 Result 'skills present' ((Test-Path (Join-Path $agentDir 'skills\winsend\SKILL.md')) -and (Test-Path (Join-Path $agentDir 'skills\memory-rag\SKILL.md'))) ''
 Result 'install record' (Test-Path (Join-Path $agentDir 'installed.json')) ''
+if ($tg) {
+    $null = & $py -c "import faster_whisper, imageio_ffmpeg" 2>&1
+    Result 'voice + video tools' ($LASTEXITCODE -eq 0) 'faster-whisper, imageio-ffmpeg'
+}
 
 Section 'windows-mcp'
 git -C '__MCPDIR__' log -1 --oneline
