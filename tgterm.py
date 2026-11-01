@@ -477,6 +477,57 @@ def screenshot():
 
 _voice_lock = threading.Lock()
 _whisper = None
+_ffmpeg = None
+
+
+def uv_install(cfg, package):
+    """add a package to this Python the first time a feature needs it"""
+    import importlib
+    uv = cfg.get("uv") or os.path.join(os.path.expanduser("~"), ".local", "bin", "uv.exe")
+    p = subprocess.run([uv, "pip", "install", "--python", sys.executable, package], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW)
+    if p.returncode != 0:
+        raise RuntimeError("install %s failed: %s" % (package, (p.stderr or p.stdout)[-300:]))
+    importlib.invalidate_caches()
+
+
+def ffmpeg_exe(cfg):
+    """ffmpeg from the imageio-ffmpeg package (no admin, no PATH changes); installed on first use"""
+    global _ffmpeg
+    with _voice_lock:
+        if _ffmpeg is None:
+            try:
+                import imageio_ffmpeg
+            except ImportError:
+                send(cfg, "第一次收到影片：正在安裝影片處理工具（約 1～2 分鐘，只有這次）…")
+                uv_install(cfg, "imageio-ffmpeg")
+                import imageio_ffmpeg
+            _ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        return _ffmpeg
+
+
+def video_frames(cfg, path, count=6):
+    """evenly spaced stills from a video, so an AI that can see images can 'watch' it"""
+    import re
+    exe = ffmpeg_exe(cfg)
+    probe = subprocess.run([exe, "-hide_banner", "-i", path], capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", creationflags=CREATE_NO_WINDOW)
+    m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", probe.stderr or "")
+    dur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)) if m else 0.0
+    n = 1 if dur < 2 else min(count, max(2, int(dur // 2)))
+    out_dir = os.path.splitext(path)[0] + "_frames"
+    os.makedirs(out_dir, exist_ok=True)
+    frames = []
+    for i in range(n):
+        t = dur * (i + 0.5) / n
+        out = os.path.join(out_dir, "frame_%02d_at_%ds.jpg" % (i + 1, int(t)))
+        subprocess.run([exe, "-hide_banner", "-loglevel", "error", "-y", "-ss", "%.2f" % t, "-i", path,
+                        "-frames:v", "1", "-vf", "scale=960:-2", out], capture_output=True, creationflags=CREATE_NO_WINDOW)
+        if os.path.exists(out):
+            frames.append(out)
+    if not frames:
+        raise RuntimeError("no frames could be read")
+    return out_dir, frames, dur
 
 
 def transcribe(cfg, path):
@@ -488,12 +539,7 @@ def transcribe(cfg, path):
                 import faster_whisper  # noqa: F401
             except ImportError:
                 send(cfg, "第一次收到語音：正在安裝語音辨識（約 3～5 分鐘，只有這次會等比較久）…")
-                uv = cfg.get("uv") or os.path.join(os.path.expanduser("~"), ".local", "bin", "uv.exe")
-                p = subprocess.run([uv, "pip", "install", "--python", sys.executable, "faster-whisper"],
-                                   capture_output=True, text=True, encoding="utf-8", errors="replace",
-                                   creationflags=CREATE_NO_WINDOW)
-                if p.returncode != 0:
-                    raise RuntimeError("install failed: " + (p.stderr or p.stdout)[-300:])
+                uv_install(cfg, "faster-whisper")
             from faster_whisper import WhisperModel
             _whisper = WhisperModel(cfg.get("voice_model", "small"), device="cpu", compute_type="int8")
         segments, _ = _whisper.transcribe(path, language=cfg.get("voice_language", "zh"),
@@ -624,6 +670,26 @@ def handle(cfg, m):
             return
         if field == "sticker":
             text = (item.get("emoji", "") + " " + text).strip()
+        if field in ("video", "video_note", "animation"):
+            # stills the AI can look at + the soundtrack as text (animations have no sound)
+            def vwork(path=path, tag=tag, caption=text, date=m.get("date"), sound=(field != "animation")):
+                notes = []
+                try:
+                    folder, frames, dur = video_frames(cfg, path)
+                    notes.append("已截 %d 張畫面（影片約 %d 秒，平均截取，請用看圖的方式看）：%s" % (len(frames), dur, folder))
+                except Exception as e:
+                    log("video frames failed: %r" % e)
+                    notes.append("截畫面失敗：%s" % e)
+                if sound:
+                    try:
+                        said = transcribe(cfg, path)
+                        notes.append("聲音轉文字：" + (said or "（沒有說話聲）"))
+                    except Exception as e:
+                        log("video transcribe failed: %r" % e)
+                        notes.append("聲音轉文字失敗：%s" % e)
+                deliver(cfg, "%s %s（%s） %s" % (tag, path, "；".join(notes), caption), date)
+            threading.Thread(target=vwork, daemon=True).start()
+            return
         if field in ("voice", "audio"):
             # transcribing can take a while (and installs itself the first time): do it off the polling loop
             def work(path=path, tag=tag, caption=text, date=m.get("date")):
