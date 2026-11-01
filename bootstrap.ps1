@@ -4,7 +4,9 @@
 # a window that reopens itself when closed, and Telegram messages typed into that same window (same conversation).
 # Dry run (changes nothing): run with AGENT_SETUP_DRYRUN=1 in the environment
 #   (optional: AGENT_SETUP_DRYRUN_AI=1|2|3, AGENT_SETUP_DRYRUN_TG=1 for a fake bot,
-#    AGENT_SETUP_DRYRUN_OUT=<folder> to write the generated files there).
+#    AGENT_SETUP_DRYRUN_OUT=<folder> to write the generated files there,
+#    AGENT_SETUP_DRYRUN_SRC=<local checkout> to render the rules sections with the python on PATH).
+# Later updates in place: Telegram /update, or  irm https://raw.githubusercontent.com/dead1786/agent-setup/main/update.ps1 | iex
 
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -36,13 +38,13 @@ $TaskName  = 'agent-watchdog'
 # the remote helper's Claude session (same account) that receives the setup report; it renames itself to this with /rename
 $Coordinator = if ($env:AGENT_SETUP_COORDINATOR) { $env:AGENT_SETUP_COORDINATOR } else { 'agent-coordinator' }
 # helper files, pinned to one commit and checked by SHA-256 (a CDN cache can never hand out another version)
-$PinCommit = '88b9c5500a0d99123603ddb968e5635d0507e460'
+$PinCommit = 'a740882cc39986d46eda581ee723c84e5d32298c'
 $PinFiles  = [ordered]@{
-    'tgterm.py'                  = 'ff924bae9347c1f69144c43845432cc6385ecb0838a3f90da1fad9028535011d'
+    'tgterm.py'                  = '1bf9650c5850819f1387fdda69f916d3d52089f081c930df9d5dd826bb42a73a'
     'winsend.py'                 = '0089b099a5196819cb891a6339dc03508f23204743adaff4517979e8295e5fa1'
     'skills/winsend/SKILL.md'    = '1f52e2fc29145ab7fa1ca4ac1a39eac9910b5b49306cce2716e452ffd7ada891'
     'skills/memory-rag/SKILL.md' = '21a521973b965eb624b0a1853e01299aefadbc1a2d793ca3bd3ac8cd6fb0de55'
-    'guard.py'                   = 'f08398d149c00303ef6025a4aa3ea8dd5aefb087a66081097ef6018ed59be293'
+    'guard.py'                   = '1dd62d221eff3f5c4f77c735bd3433ec459b558608ca4b7302228754c3bb7f5f'
     'winject/__init__.py'        = 'f25abb6cb808cdcde896f4980571bd33f15adf8c2faec6fa39ff178f9c7c8153'
     'winject/common.py'          = 'e5fff1b3e34dd548a0b2eb35f0d62b05903669a8c2cf6034dbdbd36ac35afd9b'
     'winject/control.py'         = 'e8efc0c21eae168f82f494dc19dedd8b64a93f0f4a88a7c2cda208adedf10eb5'
@@ -53,6 +55,7 @@ $PinFiles  = [ordered]@{
     'skills/winject/SKILL.md'    = 'f7a186a13b8f4165a4d1f7e1393a2fb09fc6cd11dd5014b913778f05cd06105a'
     'skills/alarm-system/SKILL.md' = '93768832ac6e7934dec7a09b911ba568f8e7bfc7379827c534467169dc7b6cf7'
     'skills/watchdog-alert/SKILL.md' = '9e581cee142485368943405746d44d29170c69cf87c93f9785af03d772b4f8e9'
+    'rules-sections.md'          = '44da2b347ad828eb775de75b66e3097d9bb8e6eb5bed399ea66059ea5bf49bd5'
 }
 $Skills = @('winsend', 'memory-rag', 'winject', 'alarm-system', 'watchdog-alert')
 $script:PathAdded = @()
@@ -67,11 +70,16 @@ function Step($name, [scriptblock]$action) {
     if ($DryRun) { Say '    [dry-run] skipped' 'DarkGray'; return }
     & $action
 }
+function Target($path) {
+    # where a file really goes: a dry run with AGENT_SETUP_DRYRUN_OUT writes under that folder
+    if ($DryRun -and $DryOut) { return (Join-Path $DryOut ($path -replace ':', '')) }
+    return $path
+}
 function Write-Text($path, $text, [switch]$Lf, [switch]$Bom) {
     if ($Lf) { $text = $text -replace "`r`n", "`n" }
     if ($DryRun) {
         if (-not $DryOut) { Say "    [dry-run] would write $path ($($text.Length) chars)" 'DarkGray'; return }
-        $path = Join-Path $DryOut ($path -replace ':', '')
+        $path = Target $path
     }
     $dir = Split-Path $path -Parent
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
@@ -152,6 +160,7 @@ Step '暫停舊的設定（重新安裝時避免互搶；裝完會自動重開�
     if ((Test-Path $Py) -and (Test-Path $Tgterm) -and (Test-Path $CfgPath)) { & $Py $Tgterm close-window | Out-Host; Start-Sleep -Seconds 2 }
     Stop-ByCommandLine '*run-agent.ps1*' 'old AI window'
     Stop-ByCommandLine '*tgterm.py*bridge*' 'old Telegram bridge'
+    Stop-ByCommandLine '*tgterm.py*update*' 'running update'
     Stop-ByCommandLine '*winject*dispatcher*' 'old winject dispatcher'
     Stop-ByCommandLine '*tg-bridge*bridge.py*' 'v1 Telegram bridge'
     Stop-ByCommandLine '*--remote-control agent-setup*' 'old setup session'
@@ -327,6 +336,8 @@ Step 'Python（Telegram 橋接、看門狗、登入 QR code、螢幕截圖用）
 }
 
 Step '輔助程式（Telegram 橋接、看門狗、LINE／視窗送字、說明書）' {
+    # every helper is replaced now: backups from earlier in-place updates would roll back past this install
+    foreach ($old in 'backup', 'update-staging', 'update.lock') { Remove-Item (Join-Path $AgentDir $old) -Recurse -Force -ErrorAction SilentlyContinue }
     foreach ($rel in $PinFiles.Keys) {
         $dest = Join-Path $AgentDir ($rel -replace '/', '\')
         $tmp = $dest + '.download'
@@ -494,8 +505,9 @@ $prevPaths = if ($PrevMan -and $PrevMan.path_added) { @($PrevMan.path_added) } e
 $pathAdded = @($prevPaths + $script:PathAdded | Where-Object { $_ } | Select-Object -Unique)
 $rootPre = [bool](($PrevMan -and $PrevMan.root_preexisted) -or $RootPreexisted)
 $mcpPre = [bool](($PrevMan -and $PrevMan.mcp_preexisting) -or $script:McpPre)
+# version + file_hashes: `tgterm.py update` replaces only files that still have these hashes (unchanged since installed)
 Write-Text (Join-Path $AgentDir 'installed.json') ([ordered]@{ ours = $Ours; path_added = $pathAdded; ai = $ai; remote = $remote
-    root_preexisted = $rootPre; mcp_preexisting = $mcpPre
+    root_preexisted = $rootPre; mcp_preexisting = $mcpPre; version = $PinCommit; file_hashes = $PinFiles
     updated = (Get-Date).ToString('s') } | ConvertTo-Json -Depth 5)
 
 # ---------------------------------------------------------------- 4. Claude settings (setup phase) + status line
@@ -542,53 +554,17 @@ echo "📊 ${five_str} │ 7d: $(pct_str "$seven") │ ⏱️ $((dur/60))分$((d
 if ($NeedClaude) { Write-Text $StatusScript $statusline -Lf }
 
 # ---------------------------------------------------------------- 5. the agent: rules (name + personality) and memory
+# tgterm config first: the managed rules sections below are rendered from it (the updater re-renders them the same way)
+$mode = if ($prevCfg -and $prevCfg.mode) { [string]$prevCfg.mode } else { 'console' }
+$cfg = [ordered]@{ agent_name = $agentName; ai = $ai; root = $Root; token = $tgToken; owner_id = $ownerId; bot = $botName; prefix = '[TG] '; mode = $mode
+    uv = $UvExe; rules_vars = [ordered]@{ user = $userName; bot = $botName; tg = $tg; agent = $agentName; lang = $lang } }
+Write-Text $CfgPath ($cfg | ConvertTo-Json)
+if ($null -ne $tgBase) { Write-Text (Join-Path $AgentDir 'tgterm-state.json') ((@{ offset = $tgBase }) | ConvertTo-Json) }
+
 $rulesName = switch ($ai) { 'claude' { 'CLAUDE.md' } 'codex' { 'AGENTS.md' } 'gemini' { 'GEMINI.md' } }
 $RulesPath = Join-Path $Root $rulesName
 $workLine = if ($userWork) { "- $userName 目前在做：$userWork" } else { "- $userName 目前在做什麼還不知道，有機會就問，並記進記憶。" }
-$tgSection = if (-not $tg) { "## Telegram`n- 目前沒有接 Telegram。" } else { @"
-## Telegram（@$botName）
-- 開頭是 [TG] 的訊息，是 $userName 從 Telegram 傳來的，$userName 看不到這個視窗。處理完一定要用下面的指令把回覆傳回 Telegram，不然收不到：
-  - PowerShell／cmd：``C:\AI\.agent\py\Scripts\python.exe C:\AI\.agent\tgterm.py send "回覆內容"``
-  - Git Bash：``/c/AI/.agent/py/Scripts/python.exe C:/AI/.agent/tgterm.py send "回覆內容"``
-  - 以下說的「tgterm」都是指上面那一整串指令。
-- 回覆有多行或含雙引號時：先把內容寫進 UTF-8 文字檔，再用 ``tgterm send --text-file 檔案路徑``。
-- 傳圖片／檔案／影片給 $userName：``tgterm send --photo 路徑 說明``、``tgterm send --doc 路徑 說明``、``tgterm send --video 路徑 說明``（單檔上限 50MB、圖片 10MB）。
-- $userName 傳來的東西會帶標籤，後面是已經存好的檔案路徑：[圖片] [檔案] [影片] [動圖] [語音] [音訊] [貼圖]。圖片你可以直接看；[影片] 會附上平均截好的畫面資料夾（一張張看那些圖就等於看影片）和聲音轉成的文字；[語音] [音訊] 會附上轉好的文字。
-- 要做比較久的事，先傳一句「收到，處理中」，做完再傳結果。
-- 沒有 [TG] 開頭的訊息，是 $userName 在電腦前打字，直接在這裡回覆就好。
-- 這個指令只會傳給 $userName 本人；不要用任何方式替 $userName 對外發訊息。
-- $userName 在 Telegram 也能用 /status /stop /restart /new /screen 遙控這個視窗，這些不會送到你這裡。
-"@ }
-$remindNotify = if ($tg) { '，做完用 Telegram 告訴' + $userName } else { '' }
-$greetTg = if ($tg) { "`n- 有接 Telegram：$userName 多半在手機上，看不到這個視窗。所以上面的自我介紹和問題要完整用 Telegram 傳一份（多行內容先寫進 UTF-8 文字檔，再用 tgterm send --text-file 傳），不要只傳一句招呼；$userName 從 Telegram 或這個視窗回答都算。" } else { '' }
-$extraSections = @"
-## 提醒與排程
-- [提醒] 開頭的訊息是排好的時間到了：照內容去做（提醒 $userName、整理晨報…）$remindNotify。
-- $userName 說「幾點提醒我…」「每天早上…」時，用這些指令建立（不用另外開排程，指令就是 ``C:\AI\.agent\py\Scripts\python.exe C:\AI\.agent\tgterm.py remind ...``）：
-  - 每天：``remind add --daily 08:00 "內容"``
-  - 每週：``remind add --weekly 1,3,5 08:00 "內容"``（1＝週一 … 7＝週日）
-  - 一次：``remind add --once "2026-11-02 15:00" "內容"``，或 ``remind add --in 30 "內容"``（30 分鐘後）
-  - 查看／刪除：``remind list``、``remind del r1``
-- 「內容」是寫給未來的自己看的：寫清楚到時要做什麼、要不要通知 $userName。
-- 電腦關機時錯過的提醒，開機後 6 小時內會補發。
-
-## 說明書（需要時才讀）
-- 傳 LINE 訊息、把文字送到其他視窗：先讀 C:\AI\.agent\skills\winsend\SKILL.md。只有 $userName 明確要求才做，發之前先複述對象和內容。
-- 進階記憶（L1～L6 分層）、整理記憶、RAG 語意搜尋：先讀 C:\AI\.agent\skills\memory-rag\SKILL.md。很花用量，只在 $userName 要求時做，平常不要主動建立。
-- 要從腳本、排程把文字排隊送進視窗或 LINE（多則依序送、失敗自動重試、看佇列狀態）：先讀 C:\AI\.agent\skills\winject\SKILL.md。單次傳一則用上面的 winsend 就好。
-- 要做比上面「提醒」更複雜的定時任務系統（多任務、確認回報、沒回就重催）：先讀 C:\AI\.agent\skillslarm-system\SKILL.md。只在 $userName 要求時建立。
-- 要監控某個程式有沒有掛掉、掛了用 Telegram 通知：先讀 C:\AI\.agent\skills\watchdog-alert\SKILL.md。只在 $userName 要求時建立。
-
-## 安全防護
-- 有一道安全防護會擋下危險動作（刪掉整個資料夾、格式化、強制推送 git、關機、下載後直接執行、讀密碼／登入憑證檔、新增 MCP 工具、關掉防護本身）。被擋時會看到「[安全防護] 已擋下」。
-- 被擋了：先停下來想有沒有更安全的做法；真的需要，就告訴 $userName 你要做什麼、為什麼$(if ($tg) { '（用 Telegram 傳）' })。$userName 在 Telegram 打 /allow 後，10 分鐘內重試一次就會放行，只放行一次。
-- 不要想辦法繞過防護（換寫法、改設定、自己建放行檔都不行）。
-
-## 第一次見面
-- 如果 C:\AI\memory 裡還沒有「認識主人.md」：收到 [系統] 第一次見面的通知、或 $userName 第一次跟你說話時，先用你的個性打招呼、自我介紹（你的名字、能幫什麼、怎麼用 Telegram 和提醒），再一次問 3～5 個問題認識 $userName（工作、家人或重要的人、興趣、作息、最希望你幫什麼）。
-- 把回答整理寫進 C:\AI\memory\認識主人.md，並在 MEMORY.md 加一行索引。$greetTg
-"@
-$rules = @"
+$identity = @"
 # $agentName
 
 ## 我是誰
@@ -612,24 +588,39 @@ $workLine
 
 ## 工具
 - 已接 Windows-MCP：可以看螢幕、截圖、點擊、打字、捲動、切換視窗、讀寫剪貼簿。
-
-$tgSection
-
-$extraSections
 "@
+# the sections after the owner's part (Telegram, reminders, manuals, safety guard, first meeting) come from the pinned
+# template rules-sections.md, inside agent-setup markers, so `tgterm.py update` can refresh them later without touching
+# anything else in this file
+$RenderPy = $Py; $RenderTgterm = $Tgterm; $RenderTemplate = Join-Path $AgentDir 'rules-sections.md'
+if ($DryRun) {
+    # dry run: render from a local checkout (AGENT_SETUP_DRYRUN_SRC) with the python on PATH
+    $sysPy = Get-Command python -ErrorAction SilentlyContinue | Select-Object -First 1
+    $RenderPy = $null
+    if ($env:AGENT_SETUP_DRYRUN_SRC -and $DryOut -and $sysPy) {
+        $RenderPy = $sysPy.Source; $RenderTgterm = Join-Path $env:AGENT_SETUP_DRYRUN_SRC 'tgterm.py'
+        $RenderTemplate = Join-Path $env:AGENT_SETUP_DRYRUN_SRC 'rules-sections.md'
+    }
+}
+if ($RenderPy) {
+    $sectionsFile = Join-Path $env:TEMP ('agent-setup-rules-' + [guid]::NewGuid().ToString('N') + '.md')
+    & $RenderPy $RenderTgterm render-rules --config (Target $CfgPath) --template $RenderTemplate --out $sectionsFile; Check 'render rules'
+    $sections = [IO.File]::ReadAllText($sectionsFile, $Utf8)
+    Remove-Item $sectionsFile -Force -ErrorAction SilentlyContinue
+} else { $sections = "<!-- [dry-run] rules sections not rendered: set AGENT_SETUP_DRYRUN_SRC to a local checkout -->`n" }
+$rules = $identity + "`n`n" + $sections
 if (-not $DryRun -and (Test-Path $RulesPath) -and ([IO.File]::ReadAllText($RulesPath) -ne $rules)) {
     Copy-Item $RulesPath ($RulesPath + '.bak-' + (Get-Date).ToString('yyyyMMddHHmmss')) -Force
 }
-Write-Text $RulesPath $rules
+Write-Text $RulesPath $rules -Lf
+if ($RenderPy) {
+    # remember each managed section as written: the updater replaces only sections nobody has changed since
+    & $RenderPy $RenderTgterm rules-record --rules (Target $RulesPath) --installed (Target (Join-Path $AgentDir 'installed.json')) | Out-Host
+    Check 'record rules'
+}
 if ($DryRun -or -not (Test-Path (Join-Path $MemDir 'MEMORY.md'))) { Write-Text (Join-Path $MemDir 'MEMORY.md') "# 記憶索引`n`n（一行一個記憶檔）`n" }
 
-# ---------------------------------------------------------------- 6. tgterm config, the agent window, the watchdog
-$mode = if ($prevCfg -and $prevCfg.mode) { [string]$prevCfg.mode } else { 'console' }
-$cfg = [ordered]@{ agent_name = $agentName; ai = $ai; root = $Root; token = $tgToken; owner_id = $ownerId; bot = $botName; prefix = '[TG] '; mode = $mode
-    uv = $UvExe }
-Write-Text $CfgPath ($cfg | ConvertTo-Json)
-if ($null -ne $tgBase) { Write-Text (Join-Path $AgentDir 'tgterm-state.json') ((@{ offset = $tgBase }) | ConvertTo-Json) }
-
+# ---------------------------------------------------------------- 6. the agent window, the watchdog
 $runAgent = @'
 # Runs the AI in this window and restarts it whenever it exits.
 # Closing the window stops it; the watchdog reopens it within a minute. To keep it closed, create C:\AI\.agent\paused
@@ -723,6 +714,10 @@ Result 'winject selftest' ($LASTEXITCODE -eq 0) $wj
 $skillOk = @('winsend', 'memory-rag', 'winject', 'alarm-system', 'watchdog-alert' | Where-Object { -not (Test-Path (Join-Path $agentDir "skills\$_\SKILL.md")) }).Count -eq 0
 Result 'skills present' $skillOk ''
 Result 'install record' (Test-Path (Join-Path $agentDir 'installed.json')) ''
+# the updater can reach GitHub and read the version list (no network: skipped, not a failure)
+$uc = @(& $py $tgterm update --check 2>&1 | ForEach-Object { [string]$_ })
+$ucode = $LASTEXITCODE
+Result 'update check' ($ucode -eq 0 -or $ucode -eq 3) $(if ($ucode -eq 3) { 'no network, skipped' } else { [string]($uc | Select-Object -First 1) })
 if ($tg) {
     $null = & $py -c "import faster_whisper, imageio_ffmpeg" 2>&1
     Result 'voice + video tools' ($LASTEXITCODE -eq 0) 'faster-whisper, imageio-ffmpeg'
@@ -742,6 +737,7 @@ switch ($ai) {
 
 Section 'rules + memory'
 Result 'rules file' (Test-Path '__RULES__') '__RULES__'
+Result 'rules update markers' ((Test-Path '__RULES__') -and ((Get-Content '__RULES__' -Raw -Encoding UTF8) -match 'agent-setup:begin telegram')) ''
 Result 'memory index' (Test-Path '__ROOT__\memory\MEMORY.md') ''
 
 Section 'scheduled task'
