@@ -6,11 +6,14 @@
 #   python  tgterm.py close-window        close the agent window like a user would (watchdog test)
 #   pythonw tgterm.py watchdog            reopen the agent window / restart the bridge if gone (Task Scheduler, every minute)
 #   python  tgterm.py merge-json <target.json> <patch.json>   deep-merge a patch into a JSON file (null deletes a key)
+#   agent-login-url.exe <url>             BROWSER hook for `claude auth login`: no browser on this computer; the sign-in
+#                                         link goes out as a QR code on Telegram, the helper signs in on their own phone
+#                                         and the code shown there is pasted back into the terminal
 #   python  tgterm.py selftest            offline checks only; touches no window, console or network
 # Typing into the terminal (config "mode"):
 #   console  write key events into the agent console's input buffer (WriteConsoleInputW): no focus change, no clipboard
 #   paste    winject style: bring the agent window forward, paste with Ctrl+V, press Enter, hand focus back
-import ctypes, json, os, shutil, subprocess, sys, time, traceback, urllib.error, urllib.parse, urllib.request
+import ctypes, json, os, shutil, subprocess, sys, time, traceback, urllib.error, urllib.parse, urllib.request, uuid
 from ctypes import wintypes
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -22,6 +25,8 @@ PIDFILE = os.path.join(BASE, "agent.pid")
 PAUSED = os.path.join(BASE, "paused")
 INBOX = os.path.join(BASE, "tg-inbox")
 MUTEX = "Local\\agent-tgterm-bridge"
+# Claude Code's manual sign-in redirect (MANUAL_REDIRECT_URL in its source): the page shows a code to paste back
+MANUAL_REDIRECT = "https://platform.claude.com/oauth/code/callback"
 DETACHED_PROCESS, CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP = 0x8, 0x10, 0x200
 
 
@@ -77,6 +82,24 @@ def send(cfg, text):
     for i in range(0, len(text), 3900):
         tg(cfg, "sendMessage", chat_id=cfg["owner_id"], text=text[i:i + 3900])
     log("sent %d chars" % len(text))
+
+
+def send_photo(cfg, path, caption):
+    boundary = "----agentsetup" + uuid.uuid4().hex
+    with open(path, "rb") as f:
+        data = f.read()
+    body = b""
+    for name, value in (("chat_id", str(cfg["owner_id"])), ("caption", caption)):
+        body += ('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s\r\n' % (boundary, name, value)).encode("utf-8")
+    body += ('--%s\r\nContent-Disposition: form-data; name="photo"; filename="login-qr.png"\r\n'
+             'Content-Type: image/png\r\n\r\n' % boundary).encode("utf-8") + data + b"\r\n"
+    body += ("--%s--\r\n" % boundary).encode("utf-8")
+    req = urllib.request.Request("https://api.telegram.org/bot%s/sendPhoto" % cfg["token"], data=body,
+                                 headers={"Content-Type": "multipart/form-data; boundary=" + boundary})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        res = json.load(r)
+    if not res.get("ok"):
+        raise RuntimeError("telegram sendPhoto: %s" % res.get("description"))
 
 
 def download(cfg, file_id, name):
@@ -488,9 +511,66 @@ def merge_json(target, patch_file):
     save_json(target, data)
 
 
+# ---------------------------------------------------------------- Claude sign-in on another device
+def manual_login_url(url):
+    """Claude's browser sign-in link -> its manual twin (same PKCE challenge and state; the page shows a code)"""
+    parts = urllib.parse.urlsplit(url)
+    query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    redirect = dict(query).get("redirect_uri", "")
+    if "/oauth/authorize" not in parts.path or not redirect.startswith("http://localhost:"):
+        return None
+    query = [(k, MANUAL_REDIRECT if k == "redirect_uri" else v) for k, v in query]
+    return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query, quote_via=urllib.parse.quote)))
+
+
+def login_url(url):
+    manual = manual_login_url(url)
+    if not manual:
+        log("login hook: not a Claude sign-in link, ignored")
+        return 0
+    qr = os.path.join(BASE, "login-qr.png")
+    try:
+        import segno
+        segno.make(manual, error="m").save(qr, scale=8, border=4)
+    except Exception as e:
+        log("login hook: QR failed: %r" % e)
+        qr = None
+    cfg = load_json(CFG, {}) or {}
+    if cfg.get("token") and cfg.get("owner_id"):
+        sent = False
+        if qr:
+            try:
+                send_photo(cfg, qr, "Claude 安裝登入：請交給安裝人員，用他自己的手機掃描並按「授權」。"
+                                    "授權後網頁會顯示一串代碼，把代碼貼到電腦上「Paste code here if prompted」那一行，再按 Enter。")
+                sent = True
+            except Exception as e:
+                log("login hook: QR photo failed: %r" % e)
+        try:
+            send(cfg, "同一個登入網址（QR 掃不到時用）：\n" + manual)
+            sent = True
+        except Exception as e:
+            log("login hook: link message failed: %r" % e)
+        if sent:
+            log("login hook: sign-in link sent to Telegram")
+            return 0
+    # no Telegram: show the QR in a window of its own
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "show-qr", manual], creationflags=CREATE_NEW_CONSOLE)
+    log("login hook: QR window opened")
+    return 0
+
+
+def show_qr(url):
+    try:
+        import segno
+        segno.make(url, error="m").terminal(compact=True)
+    except Exception:
+        pass
+    print("\n" + url + "\n")
+    print("用手機掃描上面的 QR code（或打開這個網址）並授權，再把網頁上的代碼貼回安裝視窗。")
+    input("看完按 Enter 關閉這個視窗")
+
+
 # ---------------------------------------------------------------- CLI
-
-
 def selftest():
     assert ctypes.sizeof(INPUT_RECORD) == 20, ctypes.sizeof(INPUT_RECORD)
     recs = records_for("測試a😀", enter=True)
@@ -506,6 +586,13 @@ def selftest():
     assert load_json(t, None) == {"keep": 1, "nest": {"a": 1, "c": "名"}, "new": True}, load_json(t, None)
     assert load_json(t + ".bak-agent-setup", None)["drop"] == 2
     shutil.rmtree(d)
+    auto = ("https://claude.ai/oauth/authorize?code=true&client_id=abc&response_type=code"
+            "&redirect_uri=http%3A%2F%2Flocalhost%3A54545%2Fcallback&scope=user%3Ainference+user%3Aprofile"
+            "&code_challenge=XYZ&code_challenge_method=S256&state=ST")
+    q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(manual_login_url(auto)).query))
+    assert q["redirect_uri"] == MANUAL_REDIRECT and q["code_challenge"] == "XYZ" and q["state"] == "ST", q
+    assert q["scope"] == "user:inference user:profile", q
+    assert manual_login_url("https://example.com/page") is None
     print("selftest ok")
 
 
@@ -564,6 +651,10 @@ def main(argv):
         except Exception:
             log(traceback.format_exc(), WATCHDOG_LOG)
             return 1
+    elif cmd == "login-url":
+        return login_url(argv[2] if len(argv) > 2 else "")
+    elif cmd == "show-qr":
+        show_qr(argv[2])
     elif cmd == "merge-json":
         merge_json(argv[2], argv[3])
         print("merged " + argv[2])
