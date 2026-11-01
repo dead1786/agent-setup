@@ -1,4 +1,4 @@
-# agent-setup cleanup (Windows, no admin): removes everything bootstrap.ps1 installed, so the next run starts from zero.
+# agent-setup cleanup (Windows, no admin) - by Kai: removes everything bootstrap.ps1 installed, so the next run starts from zero.
 # TEST-MACHINE RESET ONLY: it also removes Claude Code, uv, Node/npm, Git and their settings even if they existed before.
 # One-liner:  irm https://raw.githubusercontent.com/dead1786/agent-setup/main/cleanup.ps1 | iex
 # Shows the list first and only deletes after you type YES. Dry run (changes nothing): AGENT_SETUP_DRYRUN=1
@@ -77,6 +77,7 @@ $task = (cmd /c "schtasks /Query /TN agent-watchdog >nul 2>&1"); $hasTask = ($LA
 Say ''
 Say '=================================================' 'Yellow'
 Say '  清除 AI 助理安裝（回到全新狀態）' 'Yellow'
+Say '                                       by Kai' 'Yellow'
 Say '=================================================' 'Yellow'
 Say '會關掉這些程式：' 'Yellow'
 if ($procs.Count) { $procs | ForEach-Object { Say ('  ' + $_.Name + '  pid ' + $_.ProcessId) 'Gray' } } else { Say '  （沒有）' 'Gray' }

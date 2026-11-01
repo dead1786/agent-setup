@@ -1,4 +1,4 @@
-# agent-setup bootstrap v2 (Windows, no admin)
+# agent-setup bootstrap v2 (Windows, no admin) - by Kai
 # One-liner:  irm https://raw.githubusercontent.com/dead1786/agent-setup/main/bootstrap.ps1 | iex
 # Gives a new user their own AI agent (Claude Code / Codex / Antigravity agy) with a name and personality, Windows-MCP,
 # a window that reopens itself when closed, and Telegram messages typed into that same window (same conversation).
@@ -120,6 +120,7 @@ if (-not $DryRun -and [Console]::IsInputRedirected) {
 Say ''
 Say '=================================================' 'Green'
 Say '  AI 助理安裝：只問一次，答完就全自動完成' 'Green'
+Say '                                       by Kai' 'Green'
 Say '=================================================' 'Green'
 
 try {
@@ -737,6 +738,7 @@ if ('__AI__' -eq 'claude') {
 }
 Write-Host ''
 Write-Host '✅ 已登出安裝者的 Claude 帳號（已確認），可以關閉這個視窗了。' -ForegroundColor Green
+Write-Host '   AI 助理安裝 by Kai' -ForegroundColor DarkGray
 '@
 $HandoffPath = Join-Path $SetupDir 'handoff.ps1'
 if ($remote) { Write-Text $HandoffPath (Fill $handoff @{ '__PY__' = $Py; '__TGTERM__' = $Tgterm; '__AI__' = $ai; '__AGENTDIR__' = $AgentDir }) -Bom }
@@ -857,6 +859,7 @@ if ($DryRun) {
     $Host.UI.RawUI.WindowTitle = '安裝完成（可關閉）'
     Say ''
     Say '檢查完成：上面 SUMMARY 全部 PASS 就是裝好了，可以關閉這個視窗。' 'Green'
+    Say '   AI 助理安裝 by Kai' 'DarkGray'
     Say '若有 FAIL：重新貼一次安裝指令即可（會問要不要沿用上次的答案，按 Enter 就好）。' 'Yellow'
 }
 } finally {
