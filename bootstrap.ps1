@@ -142,36 +142,56 @@ $reuse = $false
 $tgBase = $null
 if (-not $DryRun -and $prev -and $prev.ai) {
     $prevTg = if ($prevCfg -and $prevCfg.token) { '@' + $prev.bot } else { '不接' }
-    Say ('找到上次的答案：AI=' + $prev.ai + '　名字=' + $prev.agent_name + '　Telegram=' + $prevTg) 'Green'
+    $prevRemote = if ($prev.remote -eq $false) { '不要' } else { '要' }
+    Say ('找到上次的答案：遠端協助=' + $prevRemote + '　AI=' + $prev.ai + '　名字=' + $prev.agent_name + '　Telegram=' + $prevTg) 'Green'
     $reuse = ((Read-Host '沿用上次的答案？ [Y/n]') -notmatch '^\s*[nN]')
 }
 if ($reuse) {
+    $remote = ($prev.remote -ne $false)
     $ai = $prev.ai; $agentName = $prev.agent_name; $personality = $prev.personality; $style = $prev.style
     $wants = $prev.wants; $userName = $prev.user_name; $lang = $prev.language; $userWork = $prev.user_work
     $botName = $prev.bot
     $tgToken = $prevCfg.token
     $ownerId = $prevCfg.owner_id
 } else {
+    # 1. remote help or not: an explicit Y/N, no default, so nobody skips past what it means
+    Say ''
+    Say '1) 要不要「遠端安裝協助」？' 'Cyan'
+    Say '   Y＝要：' 'Cyan'
+    Say '     ・會暫時安裝 Claude Code 當「安裝助理」，由協助你的人用他自己的手機授權登入' 'Gray'
+    Say '     ・裝完自動檢查，並把檢查報告傳給協助者確認；確認後安裝助理自動結束、登出協助者的帳號' 'Gray'
+    Say '     ・安裝期間，協助者可以遠端看到安裝助理、請它重跑檢查或修正安裝檔（不能動你的其他檔案）' 'Gray'
+    Say '     ・會傳給協助者的資料：AI 名字與個性設定、你填的工作內容、軟體版本、Telegram 機器人名稱與你的 Telegram 帳號 ID、各項測試結果（不含密碼、不含 Telegram token）' 'Gray'
+    Say '   N＝不要：' 'Cyan'
+    Say '     ・全部在這台電腦完成，不會有任何資料傳給別人' 'Gray'
+    Say '     ・選 Codex／Gemini 不會安裝 Claude Code；選 Claude 就用你自己的帳號正常登入' 'Gray'
+    Say '     ・最後在這個視窗自動檢查，結果只顯示在畫面上；有問題要自己看畫面處理，或重新貼一次安裝指令' 'Gray'
+    $remote = $null
+    while ($null -eq $remote) {
+        $r = if ($DryRun) { $(if ($env:AGENT_SETUP_DRYRUN_REMOTE -eq '0') { 'n' } else { 'y' }) } else { [string](Read-Host '   請輸入 Y 或 N') }
+        if ($r -match '^\s*[yY]') { $remote = $true } elseif ($r -match '^\s*[nN]') { $remote = $false } else { Say '    請輸入 Y 或 N' 'Yellow' }
+    }
+
     $ai = $null
     $d1 = if ($DryRun -and $env:AGENT_SETUP_DRYRUN_AI) { $env:AGENT_SETUP_DRYRUN_AI } else { '1' }
     while (-not $ai) {
-        switch (Ask '1) 要用哪個 AI？ 1=Claude Code  2=Codex  3=Gemini（Antigravity）  [預設 1]' $d1) {
+        switch (Ask '2) 要用哪個 AI？ 1=Claude Code  2=Codex  3=Gemini（Antigravity）  [預設 1]' $d1) {
             '1' { $ai = 'claude' } '2' { $ai = 'codex' } '3' { $ai = 'gemini' }
             default { Say '    請輸入 1、2 或 3' 'Yellow' }
         }
     }
-    $agentName   = Ask '2) 幫你的 AI 取個名字 [預設 小助手]' '小助手'
-    $personality = Ask '3) 它的個性？（例：溫柔、毒舌、幽默、冷靜）[預設 親切可靠]' '親切可靠'
-    $style       = Ask '4) 說話風格？（例：簡短直接、像朋友聊天、條列重點）[預設 簡短清楚]' '簡短清楚'
-    $wants       = Ask '5) 希望它主要幫你做什麼？（例：查資料、寫文件、整理行程）[預設 日常大小事]' '日常大小事'
-    $userName    = Ask '6) 它要怎麼稱呼你？ [預設 主人]' '主人'
-    $lang        = Ask '7) 回覆用什麼語言？ [預設 繁體中文]' '繁體中文'
-    $userWork    = Ask '8) 你目前在做什麼工作或專案？（讓它更懂你；可直接按 Enter 跳過）' ''
+    $agentName   = Ask '3) 幫你的 AI 取個名字 [預設 小助手]' '小助手'
+    $personality = Ask '4) 它的個性？（例：溫柔、毒舌、幽默、冷靜）[預設 親切可靠]' '親切可靠'
+    $style       = Ask '5) 說話風格？（例：簡短直接、像朋友聊天、條列重點）[預設 簡短清楚]' '簡短清楚'
+    $wants       = Ask '6) 希望它主要幫你做什麼？（例：查資料、寫文件、整理行程）[預設 日常大小事]' '日常大小事'
+    $userName    = Ask '7) 它要怎麼稱呼你？ [預設 主人]' '主人'
+    $lang        = Ask '8) 回覆用什麼語言？ [預設 繁體中文]' '繁體中文'
+    $userWork    = Ask '9) 你目前在做什麼工作或專案？（讓它更懂你；可直接按 Enter 跳過）' ''
 
     $tgToken = $null; $botName = $null; $ownerId = $null
     if ($DryRun -and $env:AGENT_SETUP_DRYRUN_TG -eq '1') { $tgToken = 'dry-run-token'; $botName = 'dry_run_bot'; $ownerId = [long]123456789 }
     while (-not $DryRun) {
-        $t = (Read-Host '9) Telegram 機器人 token（找 @BotFather 開機器人拿到的；不接 Telegram 直接按 Enter）').Trim()
+        $t = (Read-Host '10) Telegram 機器人 token（找 @BotFather 開機器人拿到的；不接 Telegram 直接按 Enter）').Trim()
         if (-not $t) { break }
         try { $me = Invoke-RestMethod -Uri "https://api.telegram.org/bot$t/getMe" -TimeoutSec 20 } catch { $me = $null }
         if ($me -and $me.ok) { $tgToken = $t; $botName = $me.result.username; Say "    OK：@$botName" 'Green'; break }
@@ -184,7 +204,7 @@ if ($reuse) {
         $tgBase = 0
         try { $old = Invoke-RestMethod "$api/getUpdates?offset=-1&timeout=0" -TimeoutSec 20; if (@($old.result).Count) { $tgBase = [long]@($old.result)[-1].update_id + 1 } } catch {}
         while (-not $ownerId) {
-            $null = Read-Host "10) 用你自己的 Telegram 打開 @$botName，按「開始」或傳任何一句話；傳完回來這裡按 Enter"
+            $null = Read-Host "11) 用你自己的 Telegram 打開 @$botName，按「開始」或傳任何一句話；傳完回來這裡按 Enter"
             try {
                 $up = Invoke-RestMethod "$api/getUpdates?offset=$tgBase&timeout=10" -TimeoutSec 30
                 $m = @($up.result) | Where-Object { $_.message -and $_.message.chat.type -eq 'private' } | Select-Object -First 1
@@ -204,11 +224,13 @@ if ($reuse) {
 $agentName = (($agentName -replace '[\x00-\x1f"''`$;|&<>^%]', '') -replace '\s+', ' ').Trim()
 if (-not $agentName) { $agentName = 'Agent' }
 $tg = [bool]$tgToken
+# Claude Code is needed for the setup assistant (remote help) or as the AI itself
+$NeedClaude = ($remote -or $ai -eq 'claude')
 
-$answers = [ordered]@{ ai = $ai; agent_name = $agentName; personality = $personality; style = $style; wants = $wants
+$answers = [ordered]@{ remote = $remote; ai = $ai; agent_name = $agentName; personality = $personality; style = $style; wants = $wants
     user_name = $userName; language = $lang; user_work = $userWork; bot = $botName; owner_id = $ownerId; created = (Get-Date).ToString('s') }
 Write-Text (Join-Path $AgentDir 'answers.json') ($answers | ConvertTo-Json)
-Say ('設定：AI=' + $ai + '　名字=' + $agentName + '　稱呼=' + $userName + '　語言=' + $lang + '　Telegram=' + $(if ($tg) { '@' + $botName } else { '不接' })) 'Green'
+Say ('設定：遠端協助=' + $(if ($remote) { '要' } else { '不要' }) + '　AI=' + $ai + '　名字=' + $agentName + '　稱呼=' + $userName + '　語言=' + $lang + '　Telegram=' + $(if ($tg) { '@' + $botName } else { '不接' })) 'Green'
 
 if (-not $DryRun) {
     New-Item -ItemType Directory -Force -Path $Root, $AgentDir, $MemDir, $ToolsDir, $SetupDir, $UserBin | Out-Null
@@ -299,11 +321,13 @@ Step 'jq' {
     & $jq --version; Check 'jq'
 }
 
-Step 'Claude Code（安裝與遠端協助用）' {
-    if (-not (Have 'claude') -and -not (Test-Path (Join-Path $LocalBin 'claude.exe'))) { Invoke-RestMethod https://claude.ai/install.ps1 | Invoke-Expression }
-    Add-UserPath $LocalBin
-    if (-not (Have 'claude')) { throw 'Claude Code install failed: claude not found' }
-    claude --version; Check 'claude'
+if ($NeedClaude) {
+    Step $(if ($ai -eq 'claude') { 'Claude Code' } else { 'Claude Code（只給遠端安裝助理用）' }) {
+        if (-not (Have 'claude') -and -not (Test-Path (Join-Path $LocalBin 'claude.exe'))) { Invoke-RestMethod https://claude.ai/install.ps1 | Invoke-Expression }
+        Add-UserPath $LocalBin
+        if (-not (Have 'claude')) { throw 'Claude Code install failed: claude not found' }
+        claude --version; Check 'claude'
+    }
 }
 
 if ($ai -eq 'codex') {
@@ -348,10 +372,12 @@ Step 'Windows-MCP（CursorTouch，只開 13 個低風險工具）' {
     if (-not (Test-Path (Join-Path $McpDir '.git'))) { & $gitExe clone --depth 1 https://github.com/CursorTouch/Windows-MCP.git $McpDir; Check 'git clone windows-mcp' }
     & $UvExe --directory $McpDir sync; Check 'uv sync windows-mcp'
 }
-Step 'Windows-MCP 接到 Claude Code' {
-    $listed = (cmd /c "claude mcp list 2>&1" | Out-String)
-    if ($listed -match 'windows-mcp') { cmd /c "claude mcp remove windows-mcp --scope user >nul 2>&1" }
-    claude mcp add windows-mcp --scope user --transport stdio --env ANONYMIZED_TELEMETRY=false -- $UvExe @McpArgs; Check 'claude mcp add'
+if ($NeedClaude) {
+    Step 'Windows-MCP 接到 Claude Code' {
+        $listed = (cmd /c "claude mcp list 2>&1" | Out-String)
+        if ($listed -match 'windows-mcp') { cmd /c "claude mcp remove windows-mcp --scope user >nul 2>&1" }
+        claude mcp add windows-mcp --scope user --transport stdio --env ANONYMIZED_TELEMETRY=false -- $UvExe @McpArgs; Check 'claude mcp add'
+    }
 }
 if ($ai -eq 'codex') {
     Step 'Windows-MCP 接到 Codex（並信任 C:\AI）' {
@@ -385,19 +411,25 @@ if ($ai -eq 'gemini') {
 # ---------------------------------------------------------------- 4. Claude settings (setup phase) + status line
 $BashExe = (Join-Path $GitDir 'bin\bash.exe') -replace '\\', '/'
 $StatusScript = Join-Path $ClaudeDir 'statusline-command.sh'
-Step 'Claude 設定（安裝期間：免確認、接收協調訊息、略過首次導覽、信任工作資料夾）' {
-    Merge-Json (Join-Path $ClaudeDir 'settings.json') ([ordered]@{
-        crossSessionInbound = 'accept'
-        skipDangerousModePermissionPrompt = $true
-        # while the installer's account is signed in, its claude.ai connectors (Gmail, Drive, Calendar...) must not reach this machine
-        disableClaudeAiConnectors = $true
-        permissions = @{ defaultMode = 'bypassPermissions' }
-        statusLine = [ordered]@{ type = 'command'; command = "`"$BashExe`" `"" + ($StatusScript -replace '\\', '/') + '"' }
-    })
-    $projects = @{}
-    $projects['C:/AI'] = @{ hasTrustDialogAccepted = $true }
-    $projects[($SetupDir -replace '\\', '/')] = @{ hasTrustDialogAccepted = $true }
-    Merge-Json (Join-Path $HOME '.claude.json') ([ordered]@{ hasCompletedOnboarding = $true; projects = $projects })
+if ($NeedClaude) {
+    Step $(if ($remote) { 'Claude 設定（安裝期間：免確認、接收協調訊息、略過首次導覽、信任工作資料夾）' } else { 'Claude 設定（略過首次導覽、信任工作資料夾）' }) {
+        $patch = [ordered]@{
+            skipDangerousModePermissionPrompt = $true
+            statusLine = [ordered]@{ type = 'command'; command = "`"$BashExe`" `"" + ($StatusScript -replace '\\', '/') + '"' }
+        }
+        if ($remote) {
+            # setup phase only (handoff.ps1 removes these): the coordinator can message the setup assistant, no permission prompts,
+            # and the installer's claude.ai connectors (Gmail, Drive, Calendar...) never reach this machine
+            $patch.crossSessionInbound = 'accept'
+            $patch.disableClaudeAiConnectors = $true
+            $patch.permissions = @{ defaultMode = 'bypassPermissions' }
+        }
+        Merge-Json (Join-Path $ClaudeDir 'settings.json') $patch
+        $projects = @{}
+        $projects['C:/AI'] = @{ hasTrustDialogAccepted = $true }
+        if ($remote) { $projects[($SetupDir -replace '\\', '/')] = @{ hasTrustDialogAccepted = $true } }
+        Merge-Json (Join-Path $HOME '.claude.json') ([ordered]@{ hasCompletedOnboarding = $true; projects = $projects })
+    }
 }
 $statusline = @'
 #!/usr/bin/env bash
@@ -417,7 +449,7 @@ dur=$(echo "$input" | jq -r '.cost.total_duration_ms // 0'); dur=$(( ${dur%.*} /
 echo "🤖 ${model} │ 💭 ${bc}${bar}${reset} ${used_int}%"
 echo "📊 ${five_str} │ 7d: $(pct_str "$seven") │ ⏱️ $((dur/60))分$((dur%60))秒"
 '@
-Write-Text $StatusScript $statusline -Lf
+if ($NeedClaude) { Write-Text $StatusScript $statusline -Lf }
 
 # ---------------------------------------------------------------- 5. the agent: rules (name + personality) and memory
 $rulesName = switch ($ai) { 'claude' { 'CLAUDE.md' } 'codex' { 'AGENTS.md' } 'gemini' { 'GEMINI.md' } }
@@ -536,7 +568,8 @@ Section 'answers'
 Get-Content (Join-Path $agentDir 'answers.json') -Encoding UTF8
 
 Section 'versions'
-$tools = @('uv', 'git', 'jq', 'claude')
+$tools = @('uv', 'git', 'jq')
+if (__CLAUDE__) { $tools += @('claude') }
 if ($ai -eq 'codex') { $tools += @('node', 'codex') }
 if ($ai -eq 'gemini') { $tools += @('agy') }
 foreach ($c in $tools) {
@@ -555,7 +588,7 @@ switch ($ai) {
     'claude' {
         $reg = (claude mcp list 2>&1 | Out-String); Write-Output $reg
         Result 'windows-mcp connected' ($reg -match 'windows-mcp.*Connected') 'claude mcp list'
-        Result 'claude.ai connectors off' ($reg -notmatch 'claude\.ai ') 'no Gmail/Drive/Calendar of the installer account'
+        if (__REMOTE__) { Result 'claude.ai connectors off' ($reg -notmatch 'claude\.ai ') 'no Gmail/Drive/Calendar of the installer account' }
     }
     'codex'  { $reg = Get-Content (Join-Path $HOME '.codex\config.toml') -Raw -Encoding UTF8; Result 'windows-mcp registered' ($reg -match 'mcp_servers\.windows-mcp') 'codex config.toml' }
     'gemini' { $reg = Get-Content (Join-Path $HOME '.gemini\config\mcp_config.json') -Raw -Encoding UTF8; Result 'windows-mcp registered' ($reg -match 'windows-mcp') 'antigravity mcp_config.json' }
@@ -660,7 +693,8 @@ $fails = @($results.Values | Where-Object { $_ -like 'FAIL*' }).Count
 Write-Output ('TOTAL ' + $results.Count + ' checks, ' + $fails + ' failed')
 '@
 $map = @{ '__AI__' = $ai; '__NAME__' = $agentName; '__TG__' = $(if ($tg) { '$true' } else { '$false' }); '__AGENTDIR__' = $AgentDir
-    '__PY__' = $Py; '__MCPDIR__' = $McpDir; '__RULES__' = $RulesPath; '__ROOT__' = $Root; '__TASK__' = $TaskName }
+    '__PY__' = $Py; '__MCPDIR__' = $McpDir; '__RULES__' = $RulesPath; '__ROOT__' = $Root; '__TASK__' = $TaskName
+    '__CLAUDE__' = $(if ($NeedClaude) { '$true' } else { '$false' }); '__REMOTE__' = $(if ($remote) { '$true' } else { '$false' }) }
 $VerifyPath = Join-Path $SetupDir 'verify.ps1'
 Write-Text $VerifyPath (Fill $verify $map) -Bom
 
@@ -703,7 +737,7 @@ Write-Host ''
 Write-Host '✅ 已登出安裝者的 Claude 帳號（已確認），可以關閉這個視窗了。' -ForegroundColor Green
 '@
 $HandoffPath = Join-Path $SetupDir 'handoff.ps1'
-Write-Text $HandoffPath (Fill $handoff @{ '__PY__' = $Py; '__TGTERM__' = $Tgterm; '__AI__' = $ai; '__AGENTDIR__' = $AgentDir }) -Bom
+if ($remote) { Write-Text $HandoffPath (Fill $handoff @{ '__PY__' = $Py; '__TGTERM__' = $Tgterm; '__AI__' = $ai; '__AGENTDIR__' = $AgentDir }) -Bom }
 
 $finish = @'
 # Ends the setup assistant (the Claude session started with --remote-control agent-setup).
@@ -713,19 +747,28 @@ Get-CimInstance Win32_Process -Filter "Name='claude.exe'" |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
 '@
 $FinishPath = Join-Path $SetupDir 'finish-setup.ps1'
-Write-Text $FinishPath $finish -Bom
+if ($remote) { Write-Text $FinishPath $finish -Bom }
 
 # ---------------------------------------------------------------- 8. sign-ins, open the AI window, hand over to the setup session
 Say ''
-Step 'Claude 登入（安裝用帳號，用安裝人員自己的手機授權）' {
-    $st = cmd /c "claude auth status 2>nul" | Out-String
-    if ($st -match '"loggedIn"\s*:\s*true') { Say '    已登入' 'Green'; return }
-    if ($tg) { Say "    登入連結會用 Telegram（@$botName）傳一張 QR code 給你：請交給安裝人員，用他自己的手機掃描並按「授權」。" 'Yellow' }
-    else { Say '    會跳出一個視窗顯示 QR code：請安裝人員用他自己的手機掃描並按「授權」。' 'Yellow' }
-    Say '    授權後網頁會顯示一串代碼：把代碼貼到下面「Paste code here if prompted」那一行，按 Enter。' 'Yellow'
-    $env:BROWSER = $LoginHook
-    try { claude auth login --claudeai; Check 'claude auth login' }
-    finally { Remove-Item Env:BROWSER -ErrorAction SilentlyContinue }
+if ($remote) {
+    Step 'Claude 登入（安裝用帳號，用安裝人員自己的手機授權）' {
+        $st = cmd /c "claude auth status 2>nul" | Out-String
+        if ($st -match '"loggedIn"\s*:\s*true') { Say '    已登入' 'Green'; return }
+        if ($tg) { Say "    登入連結會用 Telegram（@$botName）傳一張 QR code 給你：請交給安裝人員，用他自己的手機掃描並按「授權」。" 'Yellow' }
+        else { Say '    會跳出一個視窗顯示 QR code：請安裝人員用他自己的手機掃描並按「授權」。' 'Yellow' }
+        Say '    授權後網頁會顯示一串代碼：把代碼貼到下面「Paste code here if prompted」那一行，按 Enter。' 'Yellow'
+        $env:BROWSER = $LoginHook
+        try { claude auth login --claudeai; Check 'claude auth login' }
+        finally { Remove-Item Env:BROWSER -ErrorAction SilentlyContinue }
+    }
+} elseif ($ai -eq 'claude') {
+    Step 'Claude 登入（用你自己的帳號）' {
+        $st = cmd /c "claude auth status 2>nul" | Out-String
+        if ($st -match '"loggedIn"\s*:\s*true') { Say '    已登入' 'Green'; return }
+        Say '    瀏覽器會打開：用你自己的 Claude 帳號登入並按「授權」。' 'Yellow'
+        claude auth login --claudeai; Check 'claude auth login'
+    }
 }
 if ($ai -eq 'codex') {
     Step 'Codex 登入（用你自己的 ChatGPT 帳號）' {
@@ -770,16 +813,23 @@ This computer was just prepared by its owner's own setup script. You are this ma
    If the coordinator asks for more checks instead, do them (within item 3) and report again.
 Do not change files under ~/.claude or the rules file, do not delete anything outside C:\AI\.agent, do not spend money, and do not message anyone except the coordinator.
 "@
-Write-Text (Join-Path $SetupDir 'setup-prompt.txt') $prompt
+if ($remote) { Write-Text (Join-Path $SetupDir 'setup-prompt.txt') $prompt }
 
 Say ''
 Say '安裝完成，接下來會自動進行：' 'Green'
 Say "  1. 「$agentName」的視窗已經開著（關掉也會在 1 分鐘內自己重開）。" 'Green'
 if ($ai -eq 'gemini') { Say '  2. Antigravity 第一次啟動會要你登入，請用你自己的 Google 帳號。' 'Yellow' }
 if ($tg) { Say "  *. 檢查時會傳一句「安裝測試成功」到你的 Telegram（@$botName），這是正常的。" 'Green' }
-Say '  這個視窗會變成「安裝助理」，自動檢查並主動回報給遠端協助者；協助者確認沒問題後，它會自己結束並自動登出安裝者的 Claude 帳號。' 'Green'
-Say '  看到「✅ 已登出…可以關閉這個視窗了」再關。不要直接按 X 關掉（那樣不會登出）。' 'Yellow'
-if (-not $DryRun) {
+if ($remote) {
+    Say '  這個視窗會變成「安裝助理」，自動檢查並主動回報給遠端協助者；協助者確認沒問題後，它會自己結束並自動登出安裝者的 Claude 帳號。' 'Green'
+    Say '  看到「✅ 已登出…可以關閉這個視窗了」再關。不要直接按 X 關掉（那樣不會登出）。' 'Yellow'
+} else {
+    Say '  接著在這個視窗自動檢查（約 3～5 分鐘；會在 AI 視窗打一句測試訊息，並關掉重開一次 AI 視窗），結果只顯示在這裡。' 'Green'
+}
+if ($DryRun) {
+    Say ('[dry-run] would ' + $(if ($remote) { 'start the setup assistant (claude --remote-control agent-setup) in ' + $SetupDir } else { 'run verify.ps1 here' })) 'DarkGray'
+    Say ('[dry-run] done. remote=' + $remote + ' ai=' + $ai + ' rules=' + $rulesName + ' telegram=' + $tg + ' claude=' + $NeedClaude) 'Green'
+} elseif ($remote) {
     Stop-Transcript | Out-Null
     Set-Location $SetupDir
     # a fixed title so this window is not mistaken for the AI window
@@ -793,8 +843,14 @@ if (-not $DryRun) {
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $HandoffPath
     $Host.UI.RawUI.WindowTitle = $(if ($LASTEXITCODE -eq 0) { '安裝完成（可關閉）' } else { '登出失敗：請看視窗訊息' })
 } else {
-    Say ('[dry-run] would run: claude --dangerously-skip-permissions --remote-control agent-setup <prompt> (in ' + $SetupDir + ')') 'DarkGray'
-    Say ('[dry-run] done. ai=' + $ai + ' rules=' + $rulesName + ' telegram=' + $tg) 'Green'
+    # no remote help: check right here, nothing leaves this computer
+    $Host.UI.RawUI.WindowTitle = '安裝檢查中'
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $VerifyPath
+    Stop-Transcript | Out-Null
+    $Host.UI.RawUI.WindowTitle = '安裝完成（可關閉）'
+    Say ''
+    Say '檢查完成：上面 SUMMARY 全部 PASS 就是裝好了，可以關閉這個視窗。' 'Green'
+    Say '若有 FAIL：重新貼一次安裝指令即可（會問要不要沿用上次的答案，按 Enter 就好）。' 'Yellow'
 }
 } finally {
     # never leave the watchdog paused (if setup stopped early, the previous install keeps working)
