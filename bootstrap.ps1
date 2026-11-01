@@ -120,10 +120,9 @@ Step 'uv' {
     }
     Add-UserPath $LocalBin
     # an old uv cannot download newer Pythons (Windows-MCP needs >=3.14); update it, or reinstall if self-update is unavailable
-    $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    uv self update 2>&1 | Out-Host
+    # run through cmd so uv's info lines on stderr are not shown as red PowerShell errors
+    cmd /c "uv self update 2>&1" | Out-Host
     $selfUpdateFailed = ($LASTEXITCODE -ne 0)
-    $ErrorActionPreference = $prevEap
     if ($selfUpdateFailed) { Invoke-RestMethod https://astral.sh/uv/install.ps1 | Invoke-Expression }
     uv --version; Check 'uv'
 }
