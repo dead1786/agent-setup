@@ -390,7 +390,9 @@ def handle(cfg, m):
     body = " ".join(notes + [text]).strip()
     try:
         how = inject(cfg, cfg.get("prefix", "[TG] ") + body)
-        log("injected (%s): %s" % (how, body[:80]))
+        # lag = from the owner pressing send (Telegram's timestamp) to the text being typed into the AI window
+        lag = time.time() - m.get("date", time.time())
+        log("injected (%s) lag=%.1fs: %s" % (how, lag, one_line(body)[:80]))
     except Exception as e:
         log("inject failed: %r" % e)
         send(cfg, "（訊息沒送進 AI：%s。AI 視窗如果被關掉，1 分鐘內會自動重開，請稍後再傳一次）" % e)
