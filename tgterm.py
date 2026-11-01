@@ -23,11 +23,12 @@ LOG = os.path.join(BASE, "tgterm.log")
 WATCHDOG_LOG = os.path.join(BASE, "watchdog.log")
 PIDFILE = os.path.join(BASE, "agent.pid")
 PAUSED = os.path.join(BASE, "paused")
+HANDOFF_MARK = os.path.join(BASE, "handoff-pending")   # remote setup: installer signed in, sign-out not done yet
 INBOX = os.path.join(BASE, "tg-inbox")
 MUTEX = "Local\\agent-tgterm-bridge"
 # Claude Code's manual sign-in redirect (MANUAL_REDIRECT_URL in its source): the page shows a code to paste back
 MANUAL_REDIRECT = "https://platform.claude.com/oauth/code/callback"
-DETACHED_PROCESS, CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP = 0x8, 0x10, 0x200
+DETACHED_PROCESS, CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW = 0x8, 0x10, 0x200, 0x08000000
 
 
 def log(msg, path=LOG):
@@ -467,7 +468,30 @@ def open_agent_window(cfg):
     return "console"
 
 
+def handoff_guard():
+    """remote setup: if the setup window is gone but the installer was never signed out, sign out now"""
+    data = load_json(HANDOFF_MARK, None)
+    if not isinstance(data, dict) or not data.get("handoff"):
+        return
+    pid = data.get("pid")
+    info = process_info(int(pid)) if pid else None
+    written = os.path.getmtime(HANDOFF_MARK)
+    if info and os.path.basename(info[0]).lower() == "powershell.exe" and info[1] <= written + 2:
+        return                                          # the setup window is still open; it signs out by itself
+    if time.time() - float(data.get("tried", 0)) < 50:
+        return                                          # a sign-out started less than a minute ago
+    data["tried"] = time.time()
+    save_json(HANDOFF_MARK, data)
+    subprocess.Popen(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
+                      "-File", data["handoff"]], creationflags=CREATE_NO_WINDOW)
+    log("setup window closed before sign-out: running handoff", WATCHDOG_LOG)
+
+
 def watchdog():
+    try:
+        handoff_guard()                                 # runs even while paused
+    except Exception:
+        log("handoff guard: " + traceback.format_exc(), WATCHDOG_LOG)
     if os.path.exists(PAUSED):
         return
     cfg = load_cfg()
