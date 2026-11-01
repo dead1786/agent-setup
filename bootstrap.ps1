@@ -1,6 +1,6 @@
 # agent-setup bootstrap v2 (Windows, no admin)
 # One-liner:  irm https://raw.githubusercontent.com/dead1786/agent-setup/main/bootstrap.ps1 | iex
-# Gives a new user their own AI agent (Claude Code / Codex / Gemini CLI) with a name and personality, Windows-MCP,
+# Gives a new user their own AI agent (Claude Code / Codex / Antigravity agy) with a name and personality, Windows-MCP,
 # a window that reopens itself when closed, and Telegram messages typed into that same window (same conversation).
 # Dry run (changes nothing): run with AGENT_SETUP_DRYRUN=1 in the environment
 #   (optional: AGENT_SETUP_DRYRUN_AI=1|2|3, AGENT_SETUP_DRYRUN_TG=1 for a fake bot,
@@ -24,6 +24,7 @@ $LocalBin  = Join-Path $HOME '.local\bin'
 $Programs  = Join-Path $env:LOCALAPPDATA 'Programs'
 $GitDir    = Join-Path $Programs 'PortableGit'
 $NodeDir   = Join-Path $Programs 'nodejs'
+$WingetLinks = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Links'
 $PyDir     = Join-Path $AgentDir 'py'
 $Py        = Join-Path $PyDir 'Scripts\python.exe'
 $Pyw       = Join-Path $PyDir 'Scripts\pythonw.exe'
@@ -152,7 +153,7 @@ if ($reuse) {
     $ai = $null
     $d1 = if ($DryRun -and $env:AGENT_SETUP_DRYRUN_AI) { $env:AGENT_SETUP_DRYRUN_AI } else { '1' }
     while (-not $ai) {
-        switch (Ask '1) 要用哪個 AI？ 1=Claude Code  2=Codex  3=Gemini CLI  [預設 1]' $d1) {
+        switch (Ask '1) 要用哪個 AI？ 1=Claude Code  2=Codex  3=Gemini（Antigravity）  [預設 1]' $d1) {
             '1' { $ai = 'claude' } '2' { $ai = 'codex' } '3' { $ai = 'gemini' }
             default { Say '    請輸入 1、2 或 3' 'Yellow' }
         }
@@ -270,8 +271,8 @@ Step 'Claude Code（安裝與遠端協助用）' {
     claude --version; Check 'claude'
 }
 
-if ($ai -ne 'claude') {
-    Step 'Node.js（Codex／Gemini 需要）' {
+if ($ai -eq 'codex') {
+    Step 'Node.js（Codex 需要）' {
         if (-not (Test-Path (Join-Path $NodeDir 'node.exe'))) {
             $sums = (Invoke-WebRequest -Uri 'https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt' -UseBasicParsing).Content
             $line = ($sums -split "`n") | Where-Object { $_ -match 'node-v[\d\.]+-win-x64\.zip' } | Select-Object -First 1
@@ -290,10 +291,18 @@ if ($ai -ne 'claude') {
         Add-UserPath (Join-Path $env:APPDATA 'npm')
         & (Join-Path $NodeDir 'node.exe') --version
     }
-    if ($ai -eq 'codex') {
-        Step 'Codex CLI' { & (Join-Path $NodeDir 'npm.cmd') install -g '@openai/codex'; Check 'npm codex'; codex --version }
-    } else {
-        Step 'Gemini CLI' { & (Join-Path $NodeDir 'npm.cmd') install -g '@google/gemini-cli'; Check 'npm gemini'; gemini --version }
+    Step 'Codex CLI' { & (Join-Path $NodeDir 'npm.cmd') install -g '@openai/codex'; Check 'npm codex'; codex --version }
+}
+if ($ai -eq 'gemini') {
+    # Gemini CLI no longer accepts personal Google accounts; Google's Antigravity CLI (agy) replaces it
+    Step 'Antigravity CLI（agy）' {
+        Add-UserPath $WingetLinks
+        if (-not (Have 'agy')) {
+            if (-not (Have 'winget')) { throw 'winget not found: install "App Installer" from the Microsoft Store, then run this again' }
+            winget install --id Google.AntigravityCLI -e --accept-source-agreements --accept-package-agreements --disable-interactivity
+            Check 'winget install Google.AntigravityCLI'
+        }
+        agy --version; Check 'agy'
     }
 }
 
@@ -325,12 +334,16 @@ if ($ai -eq 'codex') {
     }
 }
 if ($ai -eq 'gemini') {
-    Step 'Windows-MCP 接到 Gemini CLI（並預設 Google 登入、固定視窗標題）' {
-        Merge-Json (Join-Path $HOME '.gemini\settings.json') ([ordered]@{
+    Step 'Windows-MCP 接到 Antigravity（並信任 C:\AI）' {
+        # global MCP config per agy's built-in docs: ~/.gemini/config/mcp_config.json
+        Merge-Json (Join-Path $HOME '.gemini\config\mcp_config.json') @{
             mcpServers = @{ 'windows-mcp' = [ordered]@{ command = $UvExe; args = $McpArgs; env = @{ ANONYMIZED_TELEMETRY = 'false' } } }
-            ui = @{ hideWindowTitle = $true }
-            security = @{ auth = @{ selectedType = 'oauth-personal' } }
-        })
+        }
+        $agySettings = Join-Path $HOME '.gemini\antigravity-cli\settings.json'
+        $cur = Read-JsonObject $agySettings
+        $trusted = @(); if ($cur -and $cur.trustedWorkspaces) { $trusted = @($cur.trustedWorkspaces) }
+        if ($trusted -notcontains $Root) { $trusted += $Root }
+        Merge-Json $agySettings @{ trustedWorkspaces = $trusted }
     }
 }
 
@@ -440,18 +453,22 @@ $quick = 0
 while ($true) {
     $Host.UI.RawUI.WindowTitle = $name
     $started = Get-Date
+    # right after an install start a new conversation; after that, pick up where it left off
+    $fresh = Join-Path $agentDir 'fresh-start'
+    $resume = $false
+    if (Test-Path $fresh) { Remove-Item $fresh -Force } elseif ($quick -eq 0) { $resume = $true }
     switch ('__AI__') {
         'claude' {
             $a = @('--dangerously-skip-permissions', '--name', $name)
-            # right after an install start a new conversation; after that, pick up where it left off
-            $fresh = Join-Path $agentDir 'fresh-start'
-            $history = Join-Path $HOME '.claude\projects\C--AI'
-            if (Test-Path $fresh) { Remove-Item $fresh -Force }
-            elseif ($quick -eq 0 -and (Get-ChildItem $history -Filter '*.jsonl' -ErrorAction SilentlyContinue)) { $a += '--continue' }
+            if ($resume -and (Get-ChildItem (Join-Path $HOME '.claude\projects\C--AI') -Filter '*.jsonl' -ErrorAction SilentlyContinue)) { $a += '--continue' }
             & claude @a
         }
         'codex'  { & codex --dangerously-bypass-approvals-and-sandbox }
-        'gemini' { & gemini --yolo }
+        'gemini' {
+            $a = @('--dangerously-skip-permissions')
+            if ($resume -and (Get-ChildItem (Join-Path $HOME '.gemini\antigravity-cli\conversations') -ErrorAction SilentlyContinue)) { $a += '--continue' }
+            & agy @a
+        }
     }
     if (((Get-Date) - $started).TotalSeconds -lt 20) { $quick++ } else { $quick = 0 }
     $wait = if ($quick -ge 3) { 60 } else { 3 }
@@ -485,7 +502,8 @@ Get-Content (Join-Path $agentDir 'answers.json') -Encoding UTF8
 
 Section 'versions'
 $tools = @('uv', 'git', 'jq', 'claude')
-if ($ai -ne 'claude') { $tools += @('node', $ai) }
+if ($ai -eq 'codex') { $tools += @('node', 'codex') }
+if ($ai -eq 'gemini') { $tools += @('agy') }
 foreach ($c in $tools) {
     if (-not (Get-Command $c -ErrorAction SilentlyContinue)) { Result ('tool ' + $c) $false 'not found'; continue }
     $vout = & $c --version 2>&1
@@ -505,7 +523,7 @@ switch ($ai) {
         Result 'claude.ai connectors off' ($reg -notmatch 'claude\.ai ') 'no Gmail/Drive/Calendar of the installer account'
     }
     'codex'  { $reg = Get-Content (Join-Path $HOME '.codex\config.toml') -Raw -Encoding UTF8; Result 'windows-mcp registered' ($reg -match 'mcp_servers\.windows-mcp') 'codex config.toml' }
-    'gemini' { $reg = Get-Content (Join-Path $HOME '.gemini\settings.json') -Raw -Encoding UTF8; Result 'windows-mcp registered' ($reg -match 'windows-mcp') 'gemini settings.json' }
+    'gemini' { $reg = Get-Content (Join-Path $HOME '.gemini\config\mcp_config.json') -Raw -Encoding UTF8; Result 'windows-mcp registered' ($reg -match 'windows-mcp') 'antigravity mcp_config.json' }
 }
 
 Section 'rules + memory'
@@ -685,7 +703,7 @@ Write-Text (Join-Path $SetupDir 'setup-prompt.txt') $prompt
 Say ''
 Say '安裝完成，接下來會自動進行：' 'Green'
 Say "  1. 「$agentName」的視窗已經開著（關掉也會在 1 分鐘內自己重開）。" 'Green'
-if ($ai -eq 'gemini') { Say '  2. Gemini 第一次啟動會開瀏覽器，請用你自己的 Google 帳號登入。' 'Yellow' }
+if ($ai -eq 'gemini') { Say '  2. Antigravity 第一次啟動會要你登入，請用你自己的 Google 帳號。' 'Yellow' }
 if ($tg) { Say "  *. 檢查時會傳一句「安裝測試成功」到你的 Telegram（@$botName），這是正常的。" 'Green' }
 Say '  這個視窗會變成「安裝助理」，自動檢查並回報給遠端協助者，請不要關掉它。' 'Green'
 if (-not $DryRun) {

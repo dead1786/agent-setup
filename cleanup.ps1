@@ -20,6 +20,7 @@ $NodeDir  = Join-Path $env:LOCALAPPDATA 'Programs\nodejs'
 $NpmDir   = Join-Path $env:APPDATA 'npm'
 $UvPython = Join-Path $env:APPDATA 'uv'
 $ClaudeVersions = Join-Path $HOME '.local\share\claude'
+$AgyPkg   = Get-ChildItem (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages') -Directory -Filter 'Google.AntigravityCLI_*' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
 $Py       = 'C:\AI\.agent\py\Scripts\python.exe'
 $Tgterm   = 'C:\AI\.agent\tgterm.py'
 
@@ -39,19 +40,22 @@ $targets = @(
     $UvPython                                                   # uv-managed Python
     (Join-Path $env:LOCALAPPDATA 'uv')                          # uv cache
     (Join-Path $HOME '.codex')                                  # Codex settings + sign-in
-    (Join-Path $HOME '.gemini')                                 # Gemini settings + sign-in
+    (Join-Path $HOME '.gemini')                                 # Antigravity (agy) / Gemini settings + sign-in
+    $AgyPkg                                                     # Antigravity CLI program (winget)
+    (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Links\agy.exe')
+    (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Links\agy')
     $NpmDir                                                     # Codex / Gemini CLI
     (Join-Path $env:LOCALAPPDATA 'npm-cache')
     $NodeDir
     $GitDir
     (Join-Path $UserBin 'jq.exe')
     (Join-Path ([Environment]::GetFolderPath('Startup')) 'agent-tg-bridge.vbs')   # v1 leftover
-) | Where-Object { Test-Path -LiteralPath $_ }
+) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
 
 # programs that would lock those files: anything running from them, the AI window, the Telegram bridge, Claude Code
 function Test-Under($path) {
     if (-not $path) { return $false }
-    foreach ($r in @('C:\AI\', $GitDir, $NodeDir, $NpmDir, $UvPython, $LocalBin, $ClaudeVersions)) {
+    foreach ($r in @('C:\AI\', $GitDir, $NodeDir, $NpmDir, $UvPython, $LocalBin, $ClaudeVersions, $AgyPkg) | Where-Object { $_ }) {
         if ($path -like ($r.TrimEnd('\') + '\*')) { return $true }
     }
     return $false
@@ -92,6 +96,8 @@ if ($hasTask) { cmd /c "schtasks /Delete /TN agent-watchdog /F >nul 2>&1"; Say (
 if ((Test-Path $Py) -and (Test-Path $Tgterm)) { & $Py $Tgterm close-window 2>$null | Out-Null; Start-Sleep -Seconds 2 }
 foreach ($pr in $procs) { cmd /c "taskkill /PID $($pr.ProcessId) /T /F >nul 2>&1" }
 Start-Sleep -Seconds 2
+# let winget forget the Antigravity CLI too (its files are removed below either way)
+if ($AgyPkg -and (Get-Command winget -ErrorAction SilentlyContinue)) { cmd /c "winget uninstall --id Google.AntigravityCLI -e --disable-interactivity >nul 2>&1" }
 
 # 3. delete (retry once: a just-stopped program can hold a file for a moment)
 $failed = @()
