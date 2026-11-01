@@ -101,6 +101,8 @@ SHELL_RULES = [
     (r'\bclaude(?:\.exe|\.cmd)?\s+plugins?\s+(?:install|add|enable|marketplace\s+add)\b', "安裝外掛"),
     (r'disableallhooks|dangerously-bypass-hook-trust', "關掉安全防護"),
     (r'allow-once', "自己放行被擋的動作"),
+    (r'tgterm\.py["\']?\s+update\b[^\n]*--(?:source|manifest|stage2|locked)\b|agent_update_source|agent_setup_agent_dir|agent_setup_home',
+     "用非官方來源更新 AI 自己的程式"),
 ]
 SHELL_RULES = [(re.compile(p, re.I), d) for p, d in SHELL_RULES]
 
@@ -440,6 +442,8 @@ def selftest():
         ("Bash", {"command": "git checkout -- ."}),
         ("Bash", {"command": "git restore --source=HEAD -- ."}),
         ("MultiEdit", {"file_path": "C:\\AI\\.agent\\guard.py", "edits": [None]}),
+        ("Bash", {"command": "python C:\\AI\\.agent\\tgterm.py update --source C:\\AI\\mine"}),
+        ("PowerShell", {"command": "$env:AGENT_UPDATE_SOURCE='C:\\AI\\mine'; python C:\\AI\\.agent\\tgterm.py update"}),
         ("apply_patch", {"command": "*** Begin Patch\n*** Update File: C:\\Users\\me\\.codex\\hooks.json\n@@\n-x\n+y\n*** End Patch"}),
     ]
     allow = [
@@ -470,6 +474,8 @@ def selftest():
         ("Bash", {"command": "rm -rf node_modules && npm install"}),
         ("Bash", {"command": "echo skill 3 done"}),
         ("Bash", {"command": "rm *.pyc"}),
+        ("Bash", {"command": "C:\\AI\\.agent\\py\\Scripts\\python.exe C:\\AI\\.agent\\tgterm.py update"}),
+        ("Bash", {"command": "python C:\\AI\\.agent\\tgterm.py update --check"}),
         ("Bash", {"command": "rm -f node_modules/*"}),
         ("Bash", {"command": "git restore --staged ."}),
         ("Bash", {"command": "git checkout main"}),

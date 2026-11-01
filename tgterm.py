@@ -10,13 +10,21 @@
 #                                         link goes out as a QR code on Telegram, the helper signs in on their own phone
 #                                         and the code shown there is pasted back into the terminal
 #   python  tgterm.py selftest            offline checks only; touches no window, console or network
+#   python  tgterm.py update              update the helper files in place (files the owner changed are kept, the new
+#                                         version goes beside them as <file>.new); --check only looks, --rollback undoes
+#                                         the last update. Options: --source <folder|url> --manifest <file> --telegram
+#                                         --no-restart --no-notify (tests: no restarts, no Telegram, nothing typed)
+#   python  tgterm.py render-rules --config C --template T --out O   the rules sections the installer manages
+#   python  tgterm.py rules-record --rules R --installed I            remember each managed section's hash
+# AGENT_SETUP_AGENT_DIR=<folder> points at another install folder (update.ps1 runs a downloaded tgterm.py this way).
 # Typing into the terminal (config "mode"):
 #   console  write key events into the agent console's input buffer (WriteConsoleInputW): no focus change, no clipboard
 #   paste    winject style: bring the agent window forward, paste with Ctrl+V, press Enter, hand focus back
-import ctypes, json, os, shutil, subprocess, sys, threading, time, traceback, urllib.error, urllib.parse, urllib.request, uuid
+import ctypes, hashlib, json, os, re, shutil, subprocess, sys, threading, time, traceback, urllib.error, urllib.parse
+import urllib.request, uuid
 from ctypes import wintypes
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+BASE = os.path.abspath(os.environ.get("AGENT_SETUP_AGENT_DIR") or os.path.dirname(os.path.abspath(__file__)))
 CFG = os.path.join(BASE, "config.json")
 STATE = os.path.join(BASE, "tgterm-state.json")
 LOG = os.path.join(BASE, "tgterm.log")
@@ -512,7 +520,6 @@ def ffmpeg_exe(cfg):
 
 def video_frames(cfg, path, count=6):
     """evenly spaced stills from a video, so an AI that can see images can 'watch' it"""
-    import re
     exe = ffmpeg_exe(cfg)
     probe = subprocess.run([exe, "-hide_banner", "-i", path], capture_output=True, text=True, encoding="utf-8",
                            errors="replace", creationflags=CREATE_NO_WINDOW)
@@ -559,9 +566,14 @@ INCOMING = (
 )
 COMMANDS = [("status", "AI 狀態"), ("stop", "中斷 AI 正在做的事"), ("restart", "重開 AI 視窗"),
             ("new", "重開並開始新對話"), ("screen", "傳目前的電腦畫面"),
-            ("allow", "放行安全防護剛擋下的動作一次"), ("help", "指令說明")]
+            ("allow", "放行安全防護剛擋下的動作一次"), ("update", "更新輔助程式（/update 還原＝退回上一版）"),
+            ("help", "指令說明")]
+HIDDEN_COMMANDS = ("rollback",)                         # not in the Telegram menu: /還原 or /update 還原
 ALIASES = {"狀態": "status", "停": "stop", "停止": "stop", "重開": "restart", "新對話": "new",
-           "畫面": "screen", "截圖": "screen", "允許": "allow", "放行": "allow", "說明": "help"}
+           "畫面": "screen", "截圖": "screen", "允許": "allow", "放行": "allow", "說明": "help",
+           "更新": "update", "還原": "rollback"}
+ROLLBACK_WORDS = ("還原", "退回", "rollback", "undo")
+CHECK_WORDS = ("檢查", "check")
 ALLOW = os.path.join(BASE, "allow-once")                # read and removed by guard.py
 
 
@@ -594,6 +606,39 @@ def typing_loop():
 
 
 _inject_lock = threading.Lock()                         # one typing into the AI window at a time (voice runs in threads)
+_handling = threading.Lock()                            # held while received messages are handled
+_jobs, _jobs_lock = [0], threading.Lock()               # voice / video work still running in threads
+RESTART_BRIDGE = os.path.join(BASE, "bridge-restart")   # the updater asks the bridge to exit so the new code loads
+
+
+def run_job(fn):
+    with _jobs_lock:
+        _jobs[0] += 1
+
+    def run():
+        try:
+            fn()
+        finally:
+            with _jobs_lock:
+                _jobs[0] -= 1
+    threading.Thread(target=run, daemon=True).start()
+
+
+def restart_watch():
+    """exit once the updater asks and nothing is in progress; the updater (or the watchdog) starts the new code"""
+    while True:
+        time.sleep(2)
+        if not os.path.exists(RESTART_BRIDGE) or _jobs[0] or not _handling.acquire(blocking=False):
+            continue
+        if _jobs[0] or not _inject_lock.acquire(blocking=False):
+            _handling.release()
+            continue
+        try:
+            os.remove(RESTART_BRIDGE)
+        except OSError:
+            pass
+        log("bridge exit: restart asked by the updater")
+        os._exit(0)
 
 
 def deliver(cfg, body, date=None):
@@ -624,14 +669,23 @@ def restart_agent(cfg, fresh=False):
     watchdog()
 
 
-def command(cfg, name):
+def command(cfg, name, arg=""):
     if name == "status":
         pid = agent_pid()
         sent = time.strftime("%m/%d %H:%M", time.localtime(os.path.getmtime(LAST_SENT))) if os.path.exists(LAST_SENT) else "還沒有"
         busy = "（還在處理你上一則訊息）" if _awaiting["since"] else ""
-        send(cfg, "AI 視窗：%s%s\n最後一次回覆：%s\n自動重開：%s" % (
+        send(cfg, "AI 視窗：%s%s\n最後一次回覆：%s\n自動重開：%s\n版本：%s" % (
             "運作中" if pid else "沒有開著（1 分鐘內會自動重開）", busy, sent,
-            "暫停中" if os.path.exists(PAUSED) else "開啟"))
+            "暫停中" if os.path.exists(PAUSED) else "開啟", short_version(installed_version())))
+    elif name in ("update", "rollback"):
+        if name == "rollback" or arg in ROLLBACK_WORDS:
+            spawn_update("--rollback")
+            send(cfg, "開始還原到更新前的版本，好了會通知你。")
+        elif arg in CHECK_WORDS:
+            spawn_update("--check")
+        else:
+            spawn_update()
+            send(cfg, "開始更新（約 1～2 分鐘），好了會傳報告給你。你或 AI 改過的檔案不會被蓋掉。")
     elif name == "stop":
         with _inject_lock:
             how = press_escape(cfg)
@@ -655,7 +709,8 @@ def command(cfg, name):
     else:
         send(cfg, "直接傳訊息就是跟 AI 說話；圖片、檔案、影片、語音都可以傳。\n" +
              "\n".join("/%s  %s" % c for c in COMMANDS) +
-             "\n（也可以打中文：/狀態 /停 /重開 /新對話 /畫面 /允許）")
+             "\n/update 檢查  只看有沒有新版" +
+             "\n（也可以打中文：/狀態 /停 /重開 /新對話 /畫面 /允許 /更新 /還原）")
 
 
 def handle(cfg, m):
@@ -665,14 +720,16 @@ def handle(cfg, m):
         return
     text = (m.get("text") or m.get("caption") or "").strip()
     if text.startswith("/"):
-        name = text[1:].split()[0].split("@")[0] if len(text) > 1 else ""
+        parts = text[1:].split(None, 1)
+        name = parts[0].split("@")[0] if parts else ""
+        arg = parts[1].strip() if len(parts) > 1 else ""
         name = ALIASES.get(name, name.lower())
         if name == "start":
             send(cfg, "已連線，直接傳訊息給我就好。輸入 /help 看遙控指令。")
             return
-        if name in dict(COMMANDS):
+        if name in dict(COMMANDS) or name in HIDDEN_COMMANDS:
             try:
-                command(cfg, name)
+                command(cfg, name, arg)
             except Exception as e:
                 log("command %s failed: %r" % (name, e))
                 send(cfg, "（/%s 沒有成功：%s）" % (name, e))
@@ -712,7 +769,7 @@ def handle(cfg, m):
                         log("video transcribe failed: %r" % e)
                         notes.append("聲音轉文字失敗：%s" % e)
                 deliver(cfg, "%s %s（%s） %s" % (tag, path, "；".join(notes), caption), date)
-            threading.Thread(target=vwork, daemon=True).start()
+            run_job(vwork)
             return
         if field in ("voice", "audio"):
             # transcribing can take a while (and installs itself the first time): do it off the polling loop
@@ -723,7 +780,7 @@ def handle(cfg, m):
                 except Exception as e:
                     log("transcribe failed: %r" % e)
                     deliver(cfg, "%s %s（轉文字失敗：%s） %s" % (tag, path, e, caption), date)
-            threading.Thread(target=work, daemon=True).start()
+            run_job(work)
             return
         deliver(cfg, "%s %s %s" % (tag, path, text), m.get("date"))
         return
@@ -741,7 +798,12 @@ def bridge():
         log("bridge already running; exit")
         return
     log("bridge start")
+    try:
+        os.remove(RESTART_BRIDGE)                       # this process already runs the current code
+    except OSError:
+        pass
     threading.Thread(target=typing_loop, daemon=True).start()
+    threading.Thread(target=restart_watch, daemon=True).start()
     try:
         cfg = load_cfg()
         tg(cfg, "setMyCommands", commands=json.dumps([{"command": c, "description": d} for c, d in COMMANDS],
@@ -753,10 +815,11 @@ def bridge():
         try:
             cfg = load_cfg()
             res = tg(cfg, "getUpdates", offset=offset, timeout=50, allowed_updates='["message"]')
-            for u in res.get("result", []):
-                offset = u["update_id"] + 1
-                save_json(STATE, {"offset": offset})
-                handle(cfg, u.get("message") or {})
+            with _handling:
+                for u in res.get("result", []):
+                    offset = u["update_id"] + 1
+                    save_json(STATE, {"offset": offset})
+                    handle(cfg, u.get("message") or {})
         except urllib.error.HTTPError as e:
             log("telegram http %s (409 = another program uses this bot)" % e.code)
             time.sleep(15)
@@ -928,9 +991,7 @@ def watchdog():
                 f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
             log("opened agent window (%s)" % open_agent_window(cfg), WATCHDOG_LOG)
     if cfg.get("token") and not bridge_running():
-        pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-        subprocess.Popen([pyw if os.path.exists(pyw) else sys.executable, os.path.abspath(__file__), "bridge"],
-                         cwd=BASE, creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, close_fds=True)
+        start_bridge()
         log("started Telegram bridge", WATCHDOG_LOG)
     wj = os.path.join(BASE, "winject", "cli.py")
     if os.path.exists(wj):                              # keep the winject send queue running
@@ -943,6 +1004,26 @@ def watchdog():
                 log("winject: " + ((r.stdout or "") + (r.stderr or "")).strip()[:500], WATCHDOG_LOG)
         except Exception:
             log("winject: " + traceback.format_exc(), WATCHDOG_LOG)
+    try:
+        daily_update_check(cfg)
+    except Exception as e:                              # offline, GitHub down...: try again tomorrow
+        log("update check: %r" % e, WATCHDOG_LOG)
+
+
+def pythonw_exe():
+    pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    return pyw if os.path.exists(pyw) else sys.executable
+
+
+def python_exe():
+    py = os.path.join(os.path.dirname(sys.executable), "python.exe")
+    return py if os.path.exists(py) else sys.executable
+
+
+def start_bridge():
+    env = {k: v for k, v in os.environ.items() if k != "AGENT_SETUP_AGENT_DIR"}
+    subprocess.Popen([pythonw_exe(), os.path.join(BASE, "tgterm.py"), "bridge"], cwd=BASE, env=env,
+                     creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, close_fds=True)
 
 
 def merge_json(target, patch_file):
@@ -1062,6 +1143,813 @@ def show_qr(url):
     input("看完按 Enter 關閉這個視窗")
 
 
+# ---------------------------------------------------------------- rules sections (one template for installer and updater)
+RULES_NAMES = {"claude": "CLAUDE.md", "codex": "AGENTS.md", "gemini": "GEMINI.md"}
+TEMPLATE = os.path.join(BASE, "rules-sections.md")
+ANSWERS = os.path.join(BASE, "answers.json")
+BLOCK_RE = re.compile(r"<!--[ \t]*agent-setup:begin[ \t]+([\w-]+)[ \t]*-->(.*?)<!--[ \t]*agent-setup:end[ \t]+\1[ \t]*-->",
+                      re.S)
+SECTION_LINE = re.compile(r"^\{\{([#^])(\w+)\}\}\n(.*?)^\{\{/\2\}\}(?:\n|\Z)", re.M | re.S)
+SECTION = re.compile(r"\{\{([#^])(\w+)\}\}(.*?)\{\{/\2\}\}", re.S)
+VAR = re.compile(r"\{\{(\w+)\}\}")
+LABELS = {"telegram": "Telegram", "reminders": "提醒與排程", "manuals": "說明書", "guard": "安全防護",
+          "first-meeting": "第一次見面"}
+
+
+def fill(text, values):
+    """{{name}} placeholders and {{#flag}}...{{/flag}} / {{^flag}}...{{/flag}} sections (no nesting); a section tag
+    alone on its line takes the line with it; values go in last and are never read as template"""
+    def section(m):
+        return m.group(3) if bool(values.get(m.group(2))) == (m.group(1) == "#") else ""
+    text = SECTION.sub(section, SECTION_LINE.sub(section, text))
+    return VAR.sub(lambda m: "" if values.get(m.group(1)) is None else str(values[m.group(1)]), text)
+
+
+def norm_body(text):
+    return text.replace("\r\n", "\n").strip("\n")
+
+
+def block_sha(body):
+    return hashlib.sha256(norm_body(body).encode("utf-8")).hexdigest()
+
+
+def block_text(name, body):
+    return "<!-- agent-setup:begin %s -->\n%s\n<!-- agent-setup:end %s -->" % (name, norm_body(body), name)
+
+
+def render_sections(template, values):
+    """[(name, body)] in template order; text outside the markers is ignored"""
+    return [(m.group(1), norm_body(fill(m.group(2), values))) for m in BLOCK_RE.finditer(template.replace("\r\n", "\n"))]
+
+
+def sections_text(blocks):
+    return "\n\n".join(block_text(n, b) for n, b in blocks) + "\n"
+
+
+def rules_vars(cfg, answers=None):
+    """what the template needs; installs from before the updater fall back to answers.json"""
+    a = answers if isinstance(answers, dict) else {}
+    values = {"user": a.get("user_name") or "主人", "bot": cfg.get("bot"), "tg": bool(cfg.get("token")),
+              "agent": cfg.get("agent_name"), "lang": a.get("language") or "繁體中文"}
+    values.update(cfg.get("rules_vars") or {})
+    return values
+
+
+def rules_path(cfg):
+    name = RULES_NAMES.get(cfg.get("ai"))
+    return os.path.join(cfg.get("root") or r"C:\AI", name) if name else None
+
+
+def merge_rules(text, new, old, recorded):
+    """refresh the managed sections of a rules file (LF text). A section is replaced only if nobody changed it since it
+    was written: its hash was recorded then, or it equals what the installed template renders. -> (text, result)"""
+    news, olds = dict(new), dict(old)
+    res = {k: [] for k in ("replaced", "same", "kept", "added", "removed")}
+    out, pos, present = [], 0, set()
+
+    def pristine(name, body):
+        return block_sha(body) == recorded.get(name) or (name in olds and body == olds[name])
+    for m in BLOCK_RE.finditer(text):
+        name, body = m.group(1), norm_body(m.group(2))
+        present.add(name)
+        out.append(text[pos:m.start()])
+        pos = m.end()
+        if name not in news and pristine(name, body):   # the new version no longer has this section
+            res["removed"].append(name)
+            out[-1] = out[-1].rstrip("\n")
+            continue
+        if name not in news:
+            out.append(m.group(0))
+        elif body == news[name]:
+            res["same"].append(name)
+            out.append(m.group(0))
+        elif pristine(name, body):
+            res["replaced"].append(name)
+            out.append(block_text(name, news[name]))
+        else:
+            res["kept"].append(name)
+            out.append(m.group(0))
+    out.append(text[pos:])
+    text = "".join(out)
+    for name, body in new:
+        if name in present:
+            continue
+        if name in recorded:                            # taken out here: offered again, not forced back
+            res["kept"].append(name)
+        else:
+            res["added"].append(name)
+            text = text.rstrip("\n") + "\n\n" + block_text(name, body) + "\n"
+    return text, res
+
+
+def recorded_after(res, new, recorded):
+    """hashes of what the updater wrote; a section somebody changed keeps the old record so it is never overwritten"""
+    news = dict(new)
+    rec = {n: block_sha(news[n]) for n in res["replaced"] + res["same"] + res["added"]}
+    rec.update({n: recorded[n] for n in res["kept"] if n in recorded})
+    return rec
+
+
+def cli_opts(args, names):
+    o, i = {}, 0
+    while i < len(args):
+        if args[i] not in names or i + 1 >= len(args):
+            raise SystemExit("unknown option or missing value: " + args[i])
+        o[args[i][2:]] = args[i + 1]
+        i += 2
+    return o
+
+
+def render_rules_cmd(args):
+    o = cli_opts(args, ("--config", "--template", "--out"))
+    cfg_path = o.get("config", CFG)
+    cfg = load_json(cfg_path, None)
+    if not isinstance(cfg, dict):
+        raise SystemExit("config.json missing or invalid: " + cfg_path)
+    answers = load_json(os.path.join(os.path.dirname(os.path.abspath(cfg_path)), "answers.json"), None)
+    with open(o.get("template", TEMPLATE), encoding="utf-8-sig") as f:
+        blocks = render_sections(f.read(), rules_vars(cfg, answers))
+    if not blocks:
+        raise SystemExit("no agent-setup sections in the template")
+    if o.get("out"):
+        write_text(o["out"], sections_text(blocks))
+    else:
+        sys.stdout.write(sections_text(blocks))
+
+
+def rules_record_cmd(args):
+    o = cli_opts(args, ("--rules", "--installed"))
+    rules = o.get("rules") or rules_path(load_cfg())
+    path = o.get("installed", INSTALLED)
+    data = load_json(path, None)
+    data = data if isinstance(data, dict) else {}
+    data["rules_blocks"] = {m.group(1): block_sha(m.group(2)) for m in BLOCK_RE.finditer(read_text(rules)[0])}
+    save_json(path, data)
+    print("recorded %d rules section(s) in %s" % (len(data["rules_blocks"]), path))
+
+
+# ---------------------------------------------------------------- update in place
+# manifest.json on main: {"version": helpers commit, "files": {rel: sha256}, "known": {rel: [every sha256 it has had]},
+#                         "requirements": [pip packages], "notes": [what changed]}; files come from raw/<version>/<rel>.
+# A file is replaced only if it is unchanged since it was installed; otherwise the new one goes beside it as <file>.new.
+RAW = "https://raw.githubusercontent.com/dead1786/agent-setup"
+INSTALLED = os.path.join(BASE, "installed.json")
+UPDATE_LOG = os.path.join(BASE, "update.log")
+UPDATE_LOCK = os.path.join(BASE, "update.lock")
+UPDATE_STATE = os.path.join(BASE, "update-check.json")
+BACKUPS = os.path.join(BASE, "backup")
+STAGING = os.path.join(BASE, "update-staging")
+KEEP_BACKUPS = 3
+SKILL_REL = re.compile(r"^skills/([A-Za-z0-9_-]+)/SKILL\.md$")
+REQ_OK = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-\[\],<>=!~]*")
+UPDATE_FLAGS = ("check", "rollback", "telegram", "no_restart", "no_notify", "stage2", "locked", "force")
+SUGGEST_HEAD = ("# 規則檔更新建議（版本 %s）\n\n"
+                "這是新版會寫進規則檔的段落。你的規則檔是舊版格式（沒有 agent-setup 標記），所以更新程式沒有動它。\n"
+                "請 AI 跟目前的規則檔比對、說明差在哪裡；主人同意後，用下面的段落取代規則檔裡對應的段落"
+                "（Telegram、提醒與排程、說明書、安全防護、第一次見面），保留主人自己加的內容，"
+                "並保留每段前後的 agent-setup 標記，之後的更新才能自動套用。\n\n")
+NEWSEC_HEAD = ("# 規則檔新版段落（版本 %s）\n\n"
+               "規則檔裡這幾段被改過（或拿掉了），所以更新程式沒有覆蓋。請 AI 跟規則檔裡同名的段落比對、說明差在哪裡；"
+               "主人同意後再合併，並保留每段前後的 agent-setup 標記。\n\n")
+
+
+class UpdateError(Exception):
+    """a reason shown to the owner as is"""
+
+
+def load_text(path):
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            return f.read()
+    except (OSError, ValueError):
+        return ""
+
+
+def sha_of(path):
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def installed_version():
+    data = load_json(INSTALLED, None)
+    return data.get("version") if isinstance(data, dict) else None
+
+
+def short_version(v):
+    return v[:7] if v else "舊版（沒有版本紀錄）"
+
+
+def home_dir():
+    return os.environ.get("AGENT_SETUP_HOME") or os.path.expanduser("~")
+
+
+def update_source(opt=None):
+    return opt or os.environ.get("AGENT_UPDATE_SOURCE") or RAW
+
+
+def fetch(url, timeout):
+    req = urllib.request.Request(url, headers={"Cache-Control": "no-cache", "User-Agent": "agent-setup-update"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def source_read(src, rel, version):
+    """a file of that version: raw.githubusercontent.com/<repo>/<version>/<rel>, or <folder>/<rel> for a local source"""
+    if os.path.isdir(src):
+        with open(os.path.join(src, *rel.split("/")), "rb") as f:
+            return f.read()
+    return fetch("%s/%s/%s" % (src, version, rel), 60)
+
+
+def load_manifest(src, path=None, timeout=30):
+    if path or os.path.isdir(src):
+        with open(path or os.path.join(src, "manifest.json"), "rb") as f:
+            raw = f.read()
+    else:
+        raw = fetch("%s/main/manifest.json?nocache=%d" % (src, time.time()), timeout)
+    try:
+        m = json.loads(raw.decode("utf-8-sig"))
+    except ValueError:
+        raise UpdateError("更新清單（manifest.json）讀不懂")
+    check_manifest(m)
+    return m
+
+
+def safe_rel(rel):
+    return isinstance(rel, str) and all(re.fullmatch(r"[A-Za-z0-9_.-]+", p) and p not in (".", "..") for p in rel.split("/"))
+
+
+def check_manifest(m):
+    ok = isinstance(m, dict) and isinstance(m.get("version"), str) and re.fullmatch(r"[\w.-]{1,64}", m["version"])
+    ok = ok and isinstance(m.get("files"), dict) and m["files"] and all(
+        safe_rel(r) and isinstance(s, str) and re.fullmatch(r"[0-9a-f]{64}", s) for r, s in m["files"].items())
+    if not ok:
+        raise UpdateError("更新清單（manifest.json）格式不對")
+    for key, kind in (("known", dict), ("requirements", list), ("notes", list)):
+        if not isinstance(m.get(key), kind):
+            m[key] = kind()
+    m["known"] = {r: [x for x in v if isinstance(x, str)] for r, v in m["known"].items() if isinstance(v, list)}
+
+
+def take_lock():
+    """one update at a time; a lock left by an update that died (or older than 15 minutes) is taken over"""
+    for _ in range(2):
+        try:
+            fd = os.open(UPDATE_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                age = time.time() - os.path.getmtime(UPDATE_LOCK)
+                with open(UPDATE_LOCK) as f:
+                    pid = int((f.read().split() or ["0"])[0])
+            except (OSError, ValueError):
+                age, pid = 1e9, 0
+            if age < 900 and (process_info(pid) if pid else age < 10):
+                return False
+            try:
+                os.remove(UPDATE_LOCK)
+            except OSError:
+                return False
+            continue
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        return True
+    return False
+
+
+def release_lock():
+    try:
+        with open(UPDATE_LOCK) as f:
+            mine = f.read().strip() == str(os.getpid())
+        if mine:
+            os.remove(UPDATE_LOCK)
+    except OSError:
+        pass
+
+
+def read_text(path):
+    """(LF text, had BOM, used CRLF)"""
+    with open(path, "rb") as f:
+        raw = f.read()
+    return raw.decode("utf-8-sig").replace("\r\n", "\n"), raw.startswith(b"\xef\xbb\xbf"), b"\r\n" in raw
+
+
+def write_bytes(path, data):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = path + ".updating"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    for i in range(10):                                 # a file being read at this moment cannot be replaced yet
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if i == 9:
+                os.remove(tmp)
+                raise
+            time.sleep(0.5)
+
+
+def write_text(path, text, bom=False, crlf=False):
+    if crlf:
+        text = text.replace("\n", "\r\n")
+    write_bytes(path, (b"\xef\xbb\xbf" if bom else b"") + text.encode("utf-8"))
+
+
+def agent_copy(rel):
+    return os.path.join(BASE, *rel.split("/"))
+
+
+def plan_files(m, installed, ai, home):
+    """[(rel, dest, action)]: same | add | replace (unchanged since installed) | keep (changed here: <dest>.new)"""
+    known, recorded, plan = m["known"], installed.get("file_hashes") or {}, []
+    for rel, want in m["files"].items():
+        dests = [agent_copy(rel)]
+        skill = SKILL_REL.match(rel)
+        if skill and ai == "claude":
+            dests.append(os.path.join(home, ".claude", "skills", skill.group(1), "SKILL.md"))
+        for dest in dests:
+            cur = sha_of(dest)
+            if cur == want:
+                act = "same"
+            elif not os.path.exists(dest):
+                act = "add"
+            elif cur and (cur in (known.get(rel) or []) or cur == recorded.get(rel)):
+                act = "replace"
+            else:
+                act = "keep"
+            plan.append((rel, dest, act))
+    return plan
+
+
+def stage(src, m, rels):
+    """download and check every file first: nothing is touched unless all of them arrived intact"""
+    staged = {}
+    for rel in sorted(rels):
+        data = source_read(src, rel, m["version"])
+        if hashlib.sha256(data).hexdigest() != m["files"][rel]:
+            raise UpdateError("下載的 %s 檢查碼不對（可能是網路或 GitHub 快取問題）。什麼都沒改，請過幾分鐘再試。" % rel)
+        path = os.path.join(STAGING, "files", *rel.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(data)
+        staged[rel] = path
+    return staged
+
+
+def plan_rules(cfg, installed, template, version, old_ok=True):
+    """{'mode': none | missing | unreadable | suggest | managed, ...}; never edits a rules file without markers.
+    old_ok: the installed template is unchanged, so a section equal to its rendering counts as untouched"""
+    path = rules_path(cfg)
+    if not template or not path:
+        return {"mode": "none"}
+    if not os.path.exists(path):
+        return {"mode": "missing", "path": path}
+    try:
+        text, bom, crlf = read_text(path)
+    except (OSError, ValueError):
+        return {"mode": "unreadable", "path": path}
+    values = rules_vars(cfg, load_json(ANSWERS, None))
+    new = render_sections(template, values)
+    if not new:                                         # a broken template must never empty the rules file
+        return {"mode": "none"}
+    if not BLOCK_RE.search(text):
+        return {"mode": "suggest", "path": path, "side": path + ".update-suggestion.md",
+                "side_text": SUGGEST_HEAD % version + sections_text(new)}
+    old = []
+    if old_ok:
+        try:
+            with open(TEMPLATE, encoding="utf-8-sig") as f:
+                old = render_sections(f.read(), values)
+        except (OSError, ValueError):
+            pass
+    recorded = installed.get("rules_blocks") or {}
+    merged, res = merge_rules(text, new, old, recorded)
+    plan = {"mode": "managed", "path": path, "res": res, "record": recorded_after(res, new, recorded),
+            "text": merged if merged != text else None, "bom": bom, "crlf": crlf}
+    if res["kept"]:
+        news = dict(new)
+        plan["side"] = path + ".new-sections.md"
+        plan["side_text"] = NEWSEC_HEAD % version + sections_text([(n, news[n]) for n in res["kept"]])
+    # suggestions an earlier update left that no longer apply (merged, or superseded by this version)
+    plan["stale"] = [p for p in (path + ".new-sections.md", path + ".update-suggestion.md")
+                     if os.path.exists(p) and p != plan.get("side")]
+    return plan
+
+
+def new_backup_dir():
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    path, n = os.path.join(BACKUPS, stamp), 1
+    while os.path.exists(path):
+        path, n = os.path.join(BACKUPS, "%s-%d" % (stamp, n)), n + 1
+    os.makedirs(path)
+    return path
+
+
+def save_backup(bdir, info, paths):
+    """copy every file the update will write (or note that it is new) so --rollback can put things back"""
+    info["files"] = []
+    for i, path in enumerate(paths):
+        saved = None
+        if os.path.exists(path):
+            saved = "f%03d" % i
+            shutil.copy2(path, os.path.join(bdir, saved))
+        info["files"].append({"path": path, "saved": saved})
+    save_json(os.path.join(bdir, "backup.json"), info)
+
+
+def restore_backup(bdir):
+    info = load_json(os.path.join(bdir, "backup.json"), None)
+    if not isinstance(info, dict) or not isinstance(info.get("files"), list):
+        raise UpdateError("備份 %s 不完整，沒辦法還原" % bdir)
+    failed = []
+    for f in info["files"]:
+        try:
+            if f.get("saved"):
+                with open(os.path.join(bdir, f["saved"]), "rb") as fh:
+                    write_bytes(f["path"], fh.read())
+            elif os.path.exists(f["path"]):
+                os.remove(f["path"])
+        except OSError as e:
+            failed.append("%s（%s）" % (f["path"], e))
+    if failed:
+        raise UpdateError("有檔案沒還原成功：" + "、".join(failed))
+    return info
+
+
+def backup_dirs():
+    """newest first (names are <yyyymmdd-HHMMSS> or <yyyymmdd-HHMMSS>-<n>)"""
+    try:
+        names = [n for n in os.listdir(BACKUPS) if os.path.isdir(os.path.join(BACKUPS, n))]
+    except OSError:
+        return []
+    return sorted(names, key=lambda n: (n[:15], int(n[16:]) if n[16:].isdigit() else 0), reverse=True)
+
+
+def ensure_requirements(cfg, reqs):
+    import importlib.metadata as md
+    missing = []
+    for req in reqs:
+        if not isinstance(req, str) or not REQ_OK.fullmatch(req):
+            continue
+        try:
+            md.version(re.split(r"[\[<>=!~]", req, maxsplit=1)[0])
+        except md.PackageNotFoundError:
+            missing.append(req)
+    if not missing:
+        return ""
+    uv = cfg.get("uv") or os.path.join(home_dir(), ".local", "bin", "uv.exe")
+    if not os.path.exists(uv):
+        return "套件：沒裝（找不到 uv，之後用到時會再試）：" + "、".join(missing)
+    p = subprocess.run([uv, "pip", "install", "--python", python_exe()] + missing, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=900, creationflags=CREATE_NO_WINDOW)
+    if p.returncode:
+        log("requirements: " + (p.stderr or p.stdout)[-500:], UPDATE_LOG)
+        return "套件：安裝失敗（之後用到時會再試）：" + "、".join(missing)
+    return "套件：已安裝 " + "、".join(missing)
+
+
+def reinstall_guard(ai):
+    guard = os.path.join(BASE, "guard.py")
+    if ai not in RULES_NAMES or not os.path.exists(guard):
+        return ""
+    p = subprocess.run([python_exe(), guard, "install", ai], capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", timeout=120, creationflags=CREATE_NO_WINDOW)
+    if p.returncode:
+        log("guard install: " + (p.stderr or p.stdout)[-500:], UPDATE_LOG)
+        return "安全防護：重新套用失敗（原本的設定還在，詳情在 %s）" % UPDATE_LOG
+    return "安全防護：已重新套用"
+
+
+def restart_bridge():
+    if not bridge_running():
+        return "Telegram 連線：看門狗 1 分鐘內會用新版啟動"
+    with open(RESTART_BRIDGE, "w") as f:
+        f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
+    for _ in range(45):
+        time.sleep(2)
+        if not bridge_running():
+            break
+    else:
+        return "Telegram 連線：正在處理訊息，空閒後會自動用新版重開"
+    if os.path.exists(PAUSED):
+        return "Telegram 連線：已停（目前是暫停狀態）"
+    start_bridge()
+    return "Telegram 連線：已用新版重新啟動"
+
+
+def restart_background(cfg):
+    """new code for what runs in the background (the winject queue, the Telegram bridge); never the AI window"""
+    notes = []
+    wj = os.path.join(BASE, "winject", "cli.py")
+    if os.path.exists(wj):
+        r = subprocess.run([python_exe(), wj, "stop-dispatcher"], cwd=BASE, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=90, creationflags=CREATE_NO_WINDOW)
+        notes.append("送字佇列：1 分鐘內用新版重開" if r.returncode == 0 else "送字佇列：送完手上這則後由看門狗用新版重開")
+    if cfg.get("token"):
+        notes.append(restart_bridge())
+    notes.append("AI 視窗：沒有重開，正在做的事不受影響")
+    return "\n".join(notes)
+
+
+def tell_ai(text):
+    """type a [系統] note into the AI window from another process (attaching to its console would cut ours off)"""
+    try:
+        p = subprocess.run([python_exe(), os.path.join(BASE, "tgterm.py"), "_inject", "", "[系統] " + text],
+                           creationflags=DETACHED_PROCESS, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=120, env=dict(os.environ, PYTHONUTF8="1"))
+        return (p.stdout or "").startswith("ok")
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def rules_note(plan, cfg):
+    who = rules_vars(cfg, load_json(ANSWERS, None)).get("user") or "主人"
+    how = "（用 Telegram 問）" if cfg.get("token") else ""
+    if plan["mode"] == "suggest":
+        return ("輔助程式剛更新。規則檔 %s 是舊版格式，更新程式沒有動它；新版的規則段落放在 %s。請讀這個檔，跟目前的規則檔比對，"
+                "跟%s說明差在哪裡%s；%s同意後再合併：用新段落取代規則檔裡對應的段落，保留%s自己加的內容，"
+                "並保留 agent-setup 標記，之後的更新才能自動套用。沒有同意就不要改規則檔。"
+                % (plan["path"], plan["side"], who, how, who, who))
+    return ("輔助程式剛更新。規則檔 %s 裡有 %d 段被改過（或拿掉了），更新程式沒有覆蓋；這幾段的新版放在 %s。"
+            "請讀這個檔，跟規則檔裡同名的段落比對，跟%s說明差在哪裡%s；%s同意後再合併，並保留 agent-setup 標記。"
+            "沒有同意就不要改規則檔。" % (plan["path"], len(plan["res"]["kept"]), plan["side"], who, how, who))
+
+
+def rules_lines(r, told, cfg):
+    mode, merge = r["mode"], "已請 AI 讀過後跟你確認再合併" if told else "可以請 AI 讀這個檔，經你同意後再合併"
+    if mode == "missing":
+        return ["規則檔：找不到 %s，沒動" % r["path"]]
+    if mode == "unreadable":
+        return ["規則檔：讀不懂（不是 UTF-8），沒動"]
+    if mode == "suggest":
+        return ["規則檔：舊版格式（沒有更新標記），沒有自動改。新版段落放在 %s，%s" % (r["side"], merge)]
+    if mode != "managed":
+        return []
+    res, out = r["res"], []
+
+    def names(ns):
+        return "、".join(LABELS.get(n, n) for n in ns)
+    if res["replaced"]:
+        out.append("規則檔：更新了「%s」" % names(res["replaced"]))
+    if res["added"]:
+        out.append("規則檔：新增「%s」" % names(res["added"]))
+    if res["removed"]:
+        out.append("規則檔：拿掉新版不需要的「%s」" % names(res["removed"]))
+    if res["kept"]:
+        out.append("規則檔：「%s」被改過，沒動；新版放在 %s，%s" % (names(res["kept"]), r["side"], merge))
+    if not out:
+        out.append("規則檔：不用改")
+    if r.get("text"):
+        out.append("規則有變：%s讓 AI 重新讀規則（會接著之前的對話）"
+                   % ("在 Telegram 打 /restart " if cfg.get("token") else "關掉 AI 視窗（1 分鐘內自動重開）"))
+    return out
+
+
+def file_label(rel, dest):
+    return rel if dest == agent_copy(rel) else "Claude 的 %s 說明書" % SKILL_REL.match(rel).group(1)
+
+
+def rollback_hint():
+    return ("要退回上一版：Telegram 打 /update 還原，或在 PowerShell 執行\n%s %s update --rollback"
+            % (python_exe(), os.path.join(BASE, "tgterm.py")))
+
+
+def update_report(frm, m, plan, rules, extra, told, cfg):
+    def files(act):
+        return [file_label(rel, dest) for rel, dest, a in plan if a == act]
+    lines = ["✅ 更新完成：%s → %s" % (short_version(frm), short_version(m["version"]))]
+    for act, title in (("replace", "更新"), ("add", "新增")):
+        if files(act):
+            lines.append("%s %d 個：%s" % (title, len(files(act)), "、".join(files(act))))
+    if files("keep"):
+        lines.append("你或 AI 改過、沒動（新版存在旁邊的 .new 檔）：" + "、".join(files("keep")))
+    if not any(a != "same" for _, _, a in plan):
+        lines.append("檔案：都已經是新版")
+    lines += rules_lines(rules, told, cfg) + [x for x in extra if x]
+    if m["notes"]:
+        lines.append("這次更新：" + "".join("\n・" + str(n) for n in m["notes"][:5]))
+    lines.append(rollback_hint())
+    return "\n".join(lines)
+
+
+def update_say(cfg, o, text, code=0):
+    print(text)
+    log(text.replace("\n", " | "), UPDATE_LOG)
+    if (o["telegram"] or not o["check"]) and not o["no_notify"] and cfg.get("token") and cfg.get("owner_id"):
+        try:
+            send(cfg, text)
+        except Exception as e:
+            log("report not sent: %r" % e, UPDATE_LOG)
+    return code
+
+
+def safely(what, fn, *args):
+    try:
+        return fn(*args)
+    except Exception as e:
+        log("%s: %s" % (what, traceback.format_exc()), UPDATE_LOG)
+        return "%s：沒有成功（%s）" % (what, e)
+
+
+def run_newest_updater(src, m, o):
+    """an older tgterm.py hands the work to the new one, so the newest update logic always runs
+    (contract kept across versions: update --stage2 --locked --manifest F --source S [flags])"""
+    want = m["files"].get("tgterm.py")
+    if not want or sha_of(os.path.abspath(__file__)) == want:
+        return None
+    data = source_read(src, "tgterm.py", m["version"])
+    if hashlib.sha256(data).hexdigest() != want:
+        raise UpdateError("下載的 tgterm.py 檢查碼不對（可能是網路或 GitHub 快取問題）。什麼都沒改，請過幾分鐘再試。")
+    folder = os.path.join(STAGING, "self")
+    os.makedirs(folder, exist_ok=True)
+    me, mf = os.path.join(folder, "tgterm.py"), os.path.join(folder, "manifest.json")
+    with open(me, "wb") as f:
+        f.write(data)
+    save_json(mf, m)
+    args = [sys.executable, me, "update", "--stage2", "--locked", "--manifest", mf, "--source", src]
+    args += ["--" + k.replace("_", "-") for k in ("telegram", "no_restart", "no_notify", "force") if o[k]]
+    return subprocess.run(args, env=dict(os.environ, AGENT_SETUP_AGENT_DIR=BASE, PYTHONUTF8="1")).returncode
+
+
+def update_run(cfg, o):
+    installed = load_json(INSTALLED, None)
+    if not isinstance(installed, dict):
+        raise UpdateError("找不到安裝紀錄（installed.json），請用安裝指令重新安裝")
+    if load_text(PAUSED).strip() == "setup":
+        raise UpdateError("正在重新安裝中，裝完再更新")
+    src = update_source(o["source"])
+    m = load_manifest(src, o["manifest"])
+    if not o["stage2"]:
+        code = run_newest_updater(src, m, o)
+        if code is not None:
+            return code
+    frm = installed.get("version")
+    if frm == m["version"] and not o["force"]:
+        return update_say(cfg, o, "已經是最新版（%s），不用更新。" % short_version(frm))
+    ai = cfg.get("ai") or installed.get("ai")
+    plan = plan_files(m, installed, ai, home_dir())
+    staged = stage(src, m, {rel for rel, _, act in plan if act != "same"})
+    template = None
+    if "rules-sections.md" in m["files"]:
+        with open(staged.get("rules-sections.md") or TEMPLATE, encoding="utf-8-sig") as f:
+            template = f.read()
+    old_ok = all(act != "keep" for rel, dest, act in plan if rel == "rules-sections.md")
+    rules = plan_rules(cfg, installed, template, short_version(m["version"]), old_ok)
+
+    record = dict(installed, version=m["version"], updated=time.strftime("%Y-%m-%dT%H:%M:%S"))
+    record["file_hashes"] = dict(installed.get("file_hashes") or {})
+    for rel, dest, act in plan:
+        if act != "keep" and dest == agent_copy(rel):
+            record["file_hashes"][rel] = m["files"][rel]
+    if rules["mode"] == "managed":
+        record["rules_blocks"] = rules["record"]
+    writes = [(dest, staged[rel]) for rel, dest, act in plan if act in ("add", "replace")]
+    writes += [(dest + ".new", staged[rel]) for rel, dest, act in plan if act == "keep"]
+    # a <file>.new from an earlier update is stale once the file itself is current
+    stale = [dest + ".new" for rel, dest, act in plan if act != "keep" and os.path.exists(dest + ".new")]
+    stale += rules.get("stale", [])
+    paths = [d for d, _ in writes] + [p for p in (rules["path"] if rules.get("text") else None, rules.get("side")) if p]
+    bdir = new_backup_dir()
+    save_backup(bdir, {"from": frm, "to": m["version"], "time": time.strftime("%Y-%m-%d %H:%M:%S")},
+                paths + stale + [INSTALLED])
+    try:
+        for dest, path in writes:
+            with open(path, "rb") as f:
+                write_bytes(dest, f.read())
+        for path in stale:
+            os.remove(path)
+        if rules.get("text"):
+            write_text(rules["path"], rules["text"], rules["bom"], rules["crlf"])
+        if rules.get("side"):
+            write_text(rules["side"], rules["side_text"])
+        save_json(INSTALLED, record)
+    except Exception as e:
+        log(traceback.format_exc(), UPDATE_LOG)
+        try:
+            restore_backup(bdir)
+        except UpdateError as e2:
+            raise UpdateError("寫入檔案時出錯（%s），自動退回也沒有完全成功：%s。備份在 %s" % (e, e2, bdir))
+        shutil.rmtree(bdir, ignore_errors=True)
+        raise UpdateError("寫入檔案時出錯（%s），已自動退回原本的版本" % e)
+    for old in backup_dirs()[KEEP_BACKUPS:]:
+        shutil.rmtree(os.path.join(BACKUPS, old), ignore_errors=True)
+    shutil.rmtree(os.path.join(STAGING, "files"), ignore_errors=True)
+    extra = [safely("套件", ensure_requirements, cfg, m["requirements"]), safely("安全防護", reinstall_guard, ai)]
+    if not o["no_restart"]:
+        extra.append(safely("背景程式", restart_background, cfg))
+    told = bool(rules.get("side")) and not o["no_notify"] and tell_ai(rules_note(rules, cfg))
+    return update_say(cfg, o, update_report(frm, m, plan, rules, extra, told, cfg))
+
+
+def update_rollback(cfg, o):
+    names = [n for n in backup_dirs() if os.path.exists(os.path.join(BACKUPS, n, "backup.json"))]
+    if not names:
+        return update_say(cfg, o, "沒有可以還原的備份（還沒更新過，或已經還原過了）。", 1)
+    bdir = os.path.join(BACKUPS, names[0])
+    info = restore_backup(bdir)
+    shutil.rmtree(bdir, ignore_errors=True)
+    installed = load_json(INSTALLED, None) or {}
+    ai = cfg.get("ai") or (installed.get("ai") if isinstance(installed, dict) else None)
+    lines = ["↩️ 已還原到更新前的版本：%s → %s" % (short_version(info.get("to")), short_version(info.get("from"))),
+             "還原 %d 個檔案，移除更新時新增的 %d 個" % (sum(1 for f in info["files"] if f.get("saved")) - 1,
+                                               sum(1 for f in info["files"] if not f.get("saved"))),
+             safely("安全防護", reinstall_guard, ai)]
+    if not o["no_restart"]:
+        lines.append(safely("背景程式", restart_background, cfg))
+    if any(f["path"] == rules_path(cfg) for f in info["files"]):
+        lines.append("規則檔也還原了：%s讓 AI 重新讀規則" % ("在 Telegram 打 /restart " if cfg.get("token") else "關掉 AI 視窗（1 分鐘內自動重開）"))
+    if not info.get("from"):
+        lines.append("這是還沒有 /update 的舊版：之後要更新，請在 PowerShell 貼更新指令（update.ps1）")
+    return update_say(cfg, o, "\n".join(x for x in lines if x))
+
+
+def update_check(cfg, o):
+    try:
+        m = load_manifest(update_source(o["source"]), o["manifest"], timeout=15)
+    except OSError as e:
+        return update_say(cfg, o, "無法檢查更新（連不上：%s）" % e, 3)
+    except UpdateError as e:
+        return update_say(cfg, o, "無法檢查更新（%s）" % e, 1)
+    cur = installed_version()
+    if cur == m["version"]:
+        return update_say(cfg, o, "目前是最新版（%s）。" % short_version(cur))
+    return update_say(cfg, o, "有新版：%s → %s%s\n要更新：Telegram 打 /update，或在 PowerShell 貼更新指令。" % (
+        short_version(cur), short_version(m["version"]), "".join("\n・" + str(n) for n in m["notes"][:5])))
+
+
+def update_opts(args):
+    o = dict.fromkeys(UPDATE_FLAGS, False)
+    o.update(source=None, manifest=None)
+    i = 0
+    while i < len(args):
+        key = args[i][2:].replace("-", "_") if args[i].startswith("--") else ""
+        if key in ("source", "manifest") and i + 1 < len(args):
+            o[key], i = args[i + 1], i + 2
+        elif key in UPDATE_FLAGS:
+            o[key], i = True, i + 1
+        else:
+            raise SystemExit("update: unknown option " + args[i])
+    return o
+
+
+def update_main(args):
+    o = update_opts(args)
+    cfg = load_json(CFG, None)
+    if not isinstance(cfg, dict):
+        print("找不到 config.json：這台電腦沒有完整安裝 AI 助理（%s）" % CFG)
+        return 1
+    if o["check"]:
+        return update_check(cfg, o)
+    what = "還原" if o["rollback"] else "更新"
+    if not o["locked"] and not take_lock():
+        return update_say(cfg, o, "另一個更新正在進行中，請等它做完（約 1～2 分鐘）再試。", 1)
+    try:
+        return (update_rollback if o["rollback"] else update_run)(cfg, o)
+    except UpdateError as e:
+        return update_say(cfg, o, "❌ %s沒有完成：%s" % (what, e), 1)
+    except OSError as e:
+        log(traceback.format_exc(), UPDATE_LOG)
+        return update_say(cfg, o, "❌ %s沒有完成（%s）。檔案沒有被改，請稍後再試。" % (what, e), 1)
+    except Exception as e:
+        log(traceback.format_exc(), UPDATE_LOG)
+        return update_say(cfg, o, "❌ %s沒有完成（%r），詳情在 %s" % (what, e, UPDATE_LOG), 1)
+    finally:
+        if not o["locked"]:
+            release_lock()
+        shutil.rmtree(os.path.join(STAGING, "files") if o["stage2"] else STAGING, ignore_errors=True)
+
+
+def spawn_update(*flags):
+    """the update runs apart from the bridge, so it can restart the bridge when it is done"""
+    subprocess.Popen([pythonw_exe(), os.path.join(BASE, "tgterm.py"), "update", "--telegram"] + list(flags), cwd=BASE,
+                     creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, close_fds=True)
+
+
+def daily_update_check(cfg):
+    """once a day: tell the owner on Telegram when a newer version is out (once per version)"""
+    if not cfg.get("token") or os.path.exists(UPDATE_LOCK):
+        return
+    state = load_json(UPDATE_STATE, None)
+    state = state if isinstance(state, dict) else {}
+    today = time.strftime("%Y-%m-%d")
+    if state.get("day") == today:
+        return
+    state["day"] = today
+    save_json(UPDATE_STATE, state)                      # also when the check below fails: at most once a day
+    m = load_manifest(update_source(), None, timeout=15)
+    cur = installed_version()
+    if m["version"] in (cur, state.get("announced")):
+        return
+    send(cfg, "🆕 輔助程式有新版（%s → %s）%s\n打 /update 更新：你或 AI 改過的檔案不會被蓋掉，/update 還原 可以退回。"
+         % (short_version(cur), short_version(m["version"]), "".join("\n・" + str(n) for n in m["notes"][:5])))
+    state["announced"] = m["version"]
+    save_json(UPDATE_STATE, state)
+    log("announced version %s" % m["version"], WATCHDOG_LOG)
+
+
 # ---------------------------------------------------------------- CLI
 def selftest():
     assert ctypes.sizeof(INPUT_RECORD) == 20, ctypes.sizeof(INPUT_RECORD)
@@ -1117,6 +2005,39 @@ def selftest():
     finally:
         shutil.rmtree(os.path.dirname(REMINDERS))
         REMINDERS = saved
+    # rules template: sections, placeholders (values are never read as template), managed-section merge
+    tpl = ("head {{#tg}}x{{/tg}}\n<!-- agent-setup:begin a -->\n{{#tg}}\n## A（@{{bot}}）\n{{/tg}}\n{{^tg}}\n## A\n{{/tg}}\n"
+           "<!-- agent-setup:end a -->\n\n<!-- agent-setup:begin b -->\n- {{user}}{{#tg}}，TG{{/tg}}。{{#tg}}\n- tg {{user}}{{/tg}}\n"
+           "<!-- agent-setup:end b -->\n")
+    on = render_sections(tpl, {"tg": True, "bot": "b{{user}}", "user": "主人$1"})
+    assert on == [("a", "## A（@b{{user}}）"), ("b", "- 主人$1，TG。\n- tg 主人$1")], on
+    off = render_sections(tpl, {"tg": False, "bot": None, "user": "U"})
+    assert off == [("a", "## A"), ("b", "- U。")], off
+    rules, rec = "# me\n\n" + sections_text(off), {n: block_sha(b) for n, b in off}
+    text, res = merge_rules(rules, on, off, rec)
+    assert res["replaced"] == ["a", "b"] and text == "# me\n\n" + sections_text(on), (res, text)
+    assert merge_rules(text, on, off, rec)[1]["same"] == ["a", "b"]
+    assert merge_rules(rules, on, off, {})[1]["replaced"] == ["a", "b"]           # equal to the installed rendering
+    mine = rules.replace("- U。", "- U。我的規則").replace(block_text("a", "## A") + "\n\n", "")
+    text, res = merge_rules(mine, on + [("c", "C")], off, rec)
+    assert res["kept"] == ["b", "a"] and res["added"] == ["c"] and "我的規則" in text, (res, text)
+    assert text.endswith(block_text("c", "C") + "\n") and "## A" not in text, text
+    assert recorded_after(res, on + [("c", "C")], rec) == {"c": block_sha("C"), "b": rec["b"], "a": rec["a"]}
+    text, res = merge_rules(rules, [("a", "## A")], off, rec)                      # a section the new version dropped
+    assert res["removed"] == ["b"] and text == "# me\n\n" + sections_text([("a", "## A")]), (res, text)
+    assert block_sha("x\r\ny\n") == block_sha("x\ny") and not BLOCK_RE.search("# old rules, no markers")
+    o = update_opts(["--rollback", "--source", "d", "--no-restart"])
+    assert o["rollback"] and o["source"] == "d" and o["no_restart"] and not o["check"], o
+    assert safe_rel("winject/cli.py") and not safe_rel("../x") and not safe_rel("a/../b") and not safe_rel("C:/x")
+    global BACKUPS
+    saved, BACKUPS = BACKUPS, tempfile.mkdtemp()
+    try:
+        for n in ("20261101-120000", "20261101-120000-2", "20261101-120000-10", "20261031-235959-11"):
+            os.makedirs(os.path.join(BACKUPS, n))
+        assert backup_dirs() == ["20261101-120000-10", "20261101-120000-2", "20261101-120000", "20261031-235959-11"]
+    finally:
+        shutil.rmtree(BACKUPS)
+        BACKUPS = saved
     print("selftest ok")
 
 
@@ -1180,6 +2101,7 @@ def main(argv):
         print("bridge_running=%s" % bridge_running())
         print("agent_pid=%s" % agent_pid())
         print("windows_titled=%d" % len(find_windows(name)))
+        print("version=%s" % installed_version())
     elif cmd == "close-window":
         wins = find_windows(load_cfg().get("agent_name", ""))
         for w in wins:
@@ -1201,6 +2123,12 @@ def main(argv):
         print("merged " + argv[2])
     elif cmd == "restore-keys":
         print("restored %d key(s) in %s" % (restore_keys(argv[2], argv[3], argv[4:]), argv[2]))
+    elif cmd == "update":
+        return update_main(argv[2:])
+    elif cmd == "render-rules":
+        render_rules_cmd(argv[2:])
+    elif cmd == "rules-record":
+        rules_record_cmd(argv[2:])
     elif cmd == "selftest":
         selftest()
     else:

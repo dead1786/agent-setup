@@ -112,7 +112,12 @@ if ((Test-Path $Py) -and (Test-Path $Tgterm)) {
         if ((Get-Command claude -ErrorAction SilentlyContinue) -and -not ($Man -and $Man.mcp_preexisting)) {
             cmd /c "claude mcp remove windows-mcp --scope user >nul 2>&1"
         }
-        foreach ($s in 'winsend', 'memory-rag', 'winject', 'alarm-system', 'watchdog-alert') { Remove-Path (Join-Path $ClaudeDir "skills\$s") }
+        # the skills this installer copied, plus any a later update added (listed in the install record)
+        $skillNames = @('winsend', 'memory-rag', 'winject', 'alarm-system', 'watchdog-alert')
+        if ($Man -and $Man.file_hashes) {
+            $skillNames += @($Man.file_hashes.PSObject.Properties.Name | Where-Object { $_ -match '^skills/[A-Za-z0-9_-]+/SKILL\.md$' } | ForEach-Object { ($_ -split '/')[1] })
+        }
+        foreach ($s in ($skillNames | Select-Object -Unique)) { Remove-Path (Join-Path $ClaudeDir "skills\$s") }
         Remove-Path (Join-Path $ClaudeDir 'agent-setup-statusline.sh')
     }
     # ~/.gemini\config stays even when Antigravity itself is removed, so always put it back
@@ -149,7 +154,8 @@ if ($drop.jq) { Remove-Path (Join-Path $UserBin 'jq.exe') }
 if ($rootPre) {
     $rulesFile = switch ($Man.ai) { 'claude' { 'CLAUDE.md' } 'codex' { 'AGENTS.md' } 'gemini' { 'GEMINI.md' } default { $null } }
     foreach ($x in $AgentDir, (Join-Path $Root 'tools\windows-mcp'), (Join-Path $Root 'memory')) { Remove-Path $x }
-    if ($rulesFile) { Remove-Path (Join-Path $Root $rulesFile) }
+    # the rules file and what the updater may have put beside it (backups live in C:\AI\.agent, removed above)
+    if ($rulesFile) { foreach ($x in '', '.new-sections.md', '.update-suggestion.md') { Remove-Path (Join-Path $Root ($rulesFile + $x)) } }
 } else {
     Remove-Path $Root
 }
