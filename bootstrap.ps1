@@ -36,9 +36,9 @@ $TaskName  = 'agent-watchdog'
 # the remote helper's Claude session (same account) that receives the setup report; it renames itself to this with /rename
 $Coordinator = if ($env:AGENT_SETUP_COORDINATOR) { $env:AGENT_SETUP_COORDINATOR } else { 'agent-coordinator' }
 # helper files, pinned to one commit and checked by SHA-256 (a CDN cache can never hand out another version)
-$PinCommit = 'f22f22e7f130314dc13efd31d3483f44da9e3a34'
+$PinCommit = '47b1b111c038515a81ae1dc68e2c208b3dc8556b'
 $PinFiles  = [ordered]@{
-    'tgterm.py'                  = '5a2bd7415e9218cfa5f1a80fbaf262146410dfb38cd1294b01413a2c7e3274fe'
+    'tgterm.py'                  = 'f6f0ecee995acfb2b3b2b61de55ecbc3cc70e19a9e2dd21dbe57b48563699f5c'
     'winsend.py'                 = '0089b099a5196819cb891a6339dc03508f23204743adaff4517979e8295e5fa1'
     'skills/winsend/SKILL.md'    = '1f52e2fc29145ab7fa1ca4ac1a39eac9910b5b49306cce2716e452ffd7ada891'
     'skills/memory-rag/SKILL.md' = '21a521973b965eb624b0a1853e01299aefadbc1a2d793ca3bd3ac8cd6fb0de55'
@@ -519,7 +519,7 @@ $tgSection = if (-not $tg) { "## Telegram`n- 目前沒有接 Telegram。" } else
   - 以下說的「tgterm」都是指上面那一整串指令。
 - 回覆有多行或含雙引號時：先把內容寫進 UTF-8 文字檔，再用 ``tgterm send --text-file 檔案路徑``。
 - 傳圖片／檔案／影片給 $userName：``tgterm send --photo 路徑 說明``、``tgterm send --doc 路徑 說明``、``tgterm send --video 路徑 說明``（單檔上限 50MB、圖片 10MB）。
-- $userName 傳來的東西會帶標籤，後面是已經存好的檔案路徑：[圖片] [檔案] [影片] [動圖] [語音] [音訊] [貼圖]。圖片你可以直接看；[語音] 會附上轉好的文字；影片和音訊你看不到內容，只能當檔案處理。
+- $userName 傳來的東西會帶標籤，後面是已經存好的檔案路徑：[圖片] [檔案] [影片] [動圖] [語音] [音訊] [貼圖]。圖片你可以直接看；[影片] 會附上平均截好的畫面資料夾（一張張看那些圖就等於看影片）和聲音轉成的文字；[語音] [音訊] 會附上轉好的文字。
 - 要做比較久的事，先傳一句「收到，處理中」，做完再傳結果。
 - 沒有 [TG] 開頭的訊息，是 $userName 在電腦前打字，直接在這裡回覆就好。
 - 這個指令只會傳給 $userName 本人；不要用任何方式替 $userName 對外發訊息。
