@@ -35,8 +35,8 @@ $ClaudeDir = Join-Path $HOME '.claude'
 $TaskName  = 'agent-watchdog'
 # the remote helper's Claude session (same account) that receives the setup report; it renames itself to this with /rename
 $Coordinator = if ($env:AGENT_SETUP_COORDINATOR) { $env:AGENT_SETUP_COORDINATOR } else { 'agent-coordinator' }
-$TgtermUrl    = 'https://raw.githubusercontent.com/dead1786/agent-setup/12ad5bf708df4fde4180fcb2e6d621dbbc07b5f6/tgterm.py'
-$TgtermSha256 = 'a86feb2e0b1b99229c7e3a5a0db447dd928d3334ebe0fde84e7aa09888983cbe'
+$TgtermUrl    = 'https://raw.githubusercontent.com/dead1786/agent-setup/0dc23e399df8535d02738f64a0091bc307e9887d/tgterm.py'
+$TgtermSha256 = 'ecb9ffd5c6f2a474adbce39f1f6ed75e0d6953ffa2ef71cd067f3016b6d10f69'
 $McpTools  = 'Screenshot,Snapshot,DisplayInventory,ControlStatus,WaitFor,Wait,Clipboard,Click,Type,Scroll,Move,Shortcut,App'
 $Utf8      = New-Object Text.UTF8Encoding $false
 
@@ -716,6 +716,8 @@ if ($status -match '"loggedIn"\s*:\s*true') {
     Write-Host '⚠️ 登出沒有成功，請在這個視窗輸入 claude auth logout 再試一次。' -ForegroundColor Red
     exit 1
 }
+# signed out: the watchdog's safety net is no longer needed
+Remove-Item (Join-Path '__AGENTDIR__' 'handoff-pending') -Force -ErrorAction SilentlyContinue
 if ('__AI__' -eq 'claude') {
     # the AI window still holds the installer's sign-in in memory: restart it, then type /login into it
     # so the owner goes straight to the web page and signs in with their own account (Codex / agy keep their own sign-in)
@@ -751,6 +753,12 @@ if ($remote) { Write-Text $FinishPath $finish -Bom }
 
 # ---------------------------------------------------------------- 8. sign-ins, open the AI window, hand over to the setup session
 Say ''
+# the AI's own sign-in first; the installer's Claude sign-in last, so the sign-out safety net starts right after it
+if ($ai -eq 'codex') {
+    Step 'Codex 登入（用你自己的 ChatGPT 帳號）' {
+        if (Test-Path (Join-Path $HOME '.codex\auth.json')) { Say '    已登入' 'Green' } else { codex login; Check 'codex login' }
+    }
+}
 if ($remote) {
     Step 'Claude 登入（安裝用帳號，用安裝人員自己的手機授權）' {
         $st = cmd /c "claude auth status 2>nul" | Out-String
@@ -770,21 +778,13 @@ if ($remote) {
         claude auth login --claudeai; Check 'claude auth login'
     }
 }
-if ($ai -eq 'codex') {
-    Step 'Codex 登入（用你自己的 ChatGPT 帳號）' {
-        if (Test-Path (Join-Path $HOME '.codex\auth.json')) { Say '    已登入' 'Green' } else { codex login; Check 'codex login' }
-    }
+if ($remote) {
+    # sign-out safety net: until handoff.ps1 finishes, the watchdog signs the installer out as soon as this window is gone
+    Write-Text (Join-Path $AgentDir 'handoff-pending') ([ordered]@{ pid = $PID; handoff = $HandoffPath } | ConvertTo-Json)
 }
 
-# only now (signed in, everything written) may the AI window open and the watchdog start
-Step "開啟 AI 視窗「$agentName」" {
-    Set-Content -Path (Join-Path $AgentDir 'fresh-start') -Value 'install'
-    Remove-Item $Paused, (Join-Path $AgentDir 'watchdog.lock') -Force -ErrorAction SilentlyContinue
-    & $Py $Tgterm watchdog; Check 'watchdog'
-    $ok = $false
-    for ($i = 0; $i -lt 20 -and -not $ok; $i++) { Start-Sleep -Seconds 1; $ok = ((& $Py $Tgterm status | Out-String) -match 'agent_pid=\d+') }
-    if ($ok) { Say '    已開啟' 'Green' } else { Say "    AI 視窗沒有開起來，請看 $AgentDir\watchdog.log" 'Yellow' }
-}
+# only now (signed in, everything written) may the watchdog start and the AI window open
+if (-not $DryRun) { Set-Content -Path (Join-Path $AgentDir 'fresh-start') -Value 'install' }
 Step '看門狗排程（每分鐘：AI 視窗被關掉就重開、Telegram 橋接停了就重啟）' {
     schtasks.exe /Create /SC MINUTE /MO 1 /TN $TaskName /TR "$Pyw $Tgterm watchdog" /F | Out-Host
     Check 'schtasks create'
@@ -799,6 +799,13 @@ Step '看門狗排程（每分鐘：AI 視窗被關掉就重開、Telegram 橋�
         $def.Settings.ExecutionTimeLimit = 'PT5M'
         $null = $folder.RegisterTaskDefinition($TaskName, $def, 6, $null, $null, 3)
     } catch { Say "    (battery settings not changed: $_)" 'Yellow' }
+}
+Step "開啟 AI 視窗「$agentName」" {
+    Remove-Item $Paused, (Join-Path $AgentDir 'watchdog.lock') -Force -ErrorAction SilentlyContinue
+    & $Py $Tgterm watchdog; Check 'watchdog'
+    $ok = $false
+    for ($i = 0; $i -lt 20 -and -not $ok; $i++) { Start-Sleep -Seconds 1; $ok = ((& $Py $Tgterm status | Out-String) -match 'agent_pid=\d+') }
+    if ($ok) { Say '    已開啟' 'Green' } else { Say "    AI 視窗沒有開起來，請看 $AgentDir\watchdog.log" 'Yellow' }
 }
 
 $prompt = @"
@@ -822,7 +829,7 @@ if ($ai -eq 'gemini') { Say '  2. Antigravity 第一次啟動會要你登入，�
 if ($tg) { Say "  *. 檢查時會傳一句「安裝測試成功」到你的 Telegram（@$botName），這是正常的。" 'Green' }
 if ($remote) {
     Say '  這個視窗會變成「安裝助理」，自動檢查並主動回報給遠端協助者；協助者確認沒問題後，它會自己結束並自動登出安裝者的 Claude 帳號。' 'Green'
-    Say '  看到「✅ 已登出…可以關閉這個視窗了」再關。不要直接按 X 關掉（那樣不會登出）。' 'Yellow'
+    Say '  看到「✅ 已登出安裝者的 Claude 帳號（已確認），可以關閉這個視窗了」就代表全部完成。' 'Yellow'
 } else {
     Say '  接著在這個視窗自動檢查（約 3～5 分鐘；會在 AI 視窗打一句測試訊息，並關掉重開一次 AI 視窗），結果只顯示在這裡。' 'Green'
 }
