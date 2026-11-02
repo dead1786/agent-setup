@@ -1,25 +1,26 @@
 {
-  "version": "a740882cc39986d46eda581ee723c84e5d32298c",
+  "version": "8208035617d9c5044a944faeccec94a82988d654",
   "files": {
-    "tgterm.py": "1bf9650c5850819f1387fdda69f916d3d52089f081c930df9d5dd826bb42a73a",
+    "tgterm.py": "f5b7e53ebb36a25df128e1d38dcdae8a75e8bebfa372759281114ce9f437d6b8",
     "winsend.py": "0089b099a5196819cb891a6339dc03508f23204743adaff4517979e8295e5fa1",
     "skills/winsend/SKILL.md": "1f52e2fc29145ab7fa1ca4ac1a39eac9910b5b49306cce2716e452ffd7ada891",
     "skills/memory-rag/SKILL.md": "21a521973b965eb624b0a1853e01299aefadbc1a2d793ca3bd3ac8cd6fb0de55",
     "guard.py": "1dd62d221eff3f5c4f77c735bd3433ec459b558608ca4b7302228754c3bb7f5f",
     "winject/__init__.py": "f25abb6cb808cdcde896f4980571bd33f15adf8c2faec6fa39ff178f9c7c8153",
-    "winject/common.py": "e5fff1b3e34dd548a0b2eb35f0d62b05903669a8c2cf6034dbdbd36ac35afd9b",
+    "winject/common.py": "6aeafb77f1b54e2e01f38491199287ed8d83dc370382234b7c21ba1ac3878426",
     "winject/control.py": "e8efc0c21eae168f82f494dc19dedd8b64a93f0f4a88a7c2cda208adedf10eb5",
-    "winject/dispatcher.py": "5be755912842b6e641f01fee0ea3bb60be3ad3c812ee8bd72bc098a90723a478",
+    "winject/dispatcher.py": "df8ecaab8e3cc6fba700bc01da8ef536895e4036a3f895097330b633dde79098",
     "winject/cli.py": "c9794a89e4697b898f40342f1142ebe00aa1b0195d69d2489aaf6b6eac5d463c",
-    "winject/selftest.py": "a5b6478500e3e8518e075343d173a177369cdfd12669b87b3a8d96d8685af94d",
-    "winject/targets.json": "8ce5199e9a662c2b1e878057bf4a0c246d5147b1add1c2f60b2730aa26717308",
-    "skills/winject/SKILL.md": "f7a186a13b8f4165a4d1f7e1393a2fb09fc6cd11dd5014b913778f05cd06105a",
+    "winject/selftest.py": "7f1fc0219154e722d4373d4590d5898082af7b897f03cc325fb9a5ec7c5abf7f",
+    "winject/targets.json": "cb0ea5695b250aa68b6c1c4ffb882a6ef2c07f5b43a6571d9e0c0be5ca37ba24",
+    "skills/winject/SKILL.md": "7404bc6e6c504c85041e16b332920f104fc8e93abfd17140e2d6290b1d2ea964",
     "skills/alarm-system/SKILL.md": "93768832ac6e7934dec7a09b911ba568f8e7bfc7379827c534467169dc7b6cf7",
     "skills/watchdog-alert/SKILL.md": "9e581cee142485368943405746d44d29170c69cf87c93f9785af03d772b4f8e9",
     "rules-sections.md": "44da2b347ad828eb775de75b66e3097d9bb8e6eb5bed399ea66059ea5bf49bd5"
   },
   "known": {
     "tgterm.py": [
+      "f5b7e53ebb36a25df128e1d38dcdae8a75e8bebfa372759281114ce9f437d6b8",
       "1bf9650c5850819f1387fdda69f916d3d52089f081c930df9d5dd826bb42a73a",
       "ff924bae9347c1f69144c43845432cc6385ecb0838a3f90da1fad9028535011d",
       "b2811d523ce0222d6e9964ec4530a7546f05f8a0eb1f454a9c688a066c9b8049",
@@ -48,24 +49,29 @@
       "f25abb6cb808cdcde896f4980571bd33f15adf8c2faec6fa39ff178f9c7c8153"
     ],
     "winject/common.py": [
+      "6aeafb77f1b54e2e01f38491199287ed8d83dc370382234b7c21ba1ac3878426",
       "e5fff1b3e34dd548a0b2eb35f0d62b05903669a8c2cf6034dbdbd36ac35afd9b"
     ],
     "winject/control.py": [
       "e8efc0c21eae168f82f494dc19dedd8b64a93f0f4a88a7c2cda208adedf10eb5"
     ],
     "winject/dispatcher.py": [
+      "df8ecaab8e3cc6fba700bc01da8ef536895e4036a3f895097330b633dde79098",
       "5be755912842b6e641f01fee0ea3bb60be3ad3c812ee8bd72bc098a90723a478"
     ],
     "winject/cli.py": [
       "c9794a89e4697b898f40342f1142ebe00aa1b0195d69d2489aaf6b6eac5d463c"
     ],
     "winject/selftest.py": [
+      "7f1fc0219154e722d4373d4590d5898082af7b897f03cc325fb9a5ec7c5abf7f",
       "a5b6478500e3e8518e075343d173a177369cdfd12669b87b3a8d96d8685af94d"
     ],
     "winject/targets.json": [
+      "cb0ea5695b250aa68b6c1c4ffb882a6ef2c07f5b43a6571d9e0c0be5ca37ba24",
       "8ce5199e9a662c2b1e878057bf4a0c246d5147b1add1c2f60b2730aa26717308"
     ],
     "skills/winject/SKILL.md": [
+      "7404bc6e6c504c85041e16b332920f104fc8e93abfd17140e2d6290b1d2ea964",
       "f7a186a13b8f4165a4d1f7e1393a2fb09fc6cd11dd5014b913778f05cd06105a"
     ],
     "skills/alarm-system/SKILL.md": [
@@ -83,6 +89,6 @@
     "pillow"
   ],
   "notes": [
-    "新增 /update 更新功能：只換你沒改過的檔案，改過的另存 .new；規則檔分段更新；每天提醒新版"
+    "送字改良：訊息直接打進 AI 終端（不搶視窗、保留換行、不會卡在輸入框），排隊送字到 AI 視窗也改這種方式"
   ]
 }
