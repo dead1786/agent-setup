@@ -59,7 +59,9 @@ TEMP_SUFFIXES = (".tmp", ".cancel", ".bad")
 TARGETS_COMMENT = ("winject targets. type: window (a window title, typed with winsend window) or line (a LINE chat "
                    "opened as its own window). title: the whole window title (matched exactly, ignoring case and "
                    "full/half width) or title_from_config: a key of config.json. priority: high|normal. prefix: "
-                   "add '[source→target] ' in front. Edit with: winject\\cli.py add-target / remove-target.")
+                   "add '[source→target] ' in front. console: type straight into this computer's AI terminal "
+                   "(no focus, no clipboard; pastes when that fails); only the target titled config.json agent_name, "
+                   "on by default there. Edit with: winject\\cli.py add-target / remove-target.")
 
 
 class Paths:
@@ -425,6 +427,22 @@ def resolve_title(p, t):
     return (v, "stored") if v else (None, "the target has no title")
 
 
+def uses_console(p, t):
+    """type into this computer's AI terminal through tgterm's console path (no focus, no clipboard) first?
+    Only for the target that IS that window: tgterm types into that one terminal whatever the target's title.
+    On by default for the title_from_config agent_name target (data-folder copies made before this flag existed);
+    never when config.json mode is paste (the installer found console typing does not work on this computer)."""
+    if t.get("type", "window") != "window" or t.get("enter", True) is False:
+        return False
+    if not t.get("console", t.get("title_from_config") == "agent_name"):
+        return False
+    cfg = read_json(p.config, None)
+    if not isinstance(cfg, dict) or cfg.get("mode") == "paste":
+        return False
+    title, _ = resolve_title(p, t)
+    return bool(title) and title == " ".join(str(cfg.get("agent_name") or "").split())
+
+
 def describe_target(p, name, t):
     kind = t.get("type", "window")
     title, where = resolve_title(p, t)
@@ -432,6 +450,8 @@ def describe_target(p, name, t):
     bits = ["%-14s [%s]" % (name, kind), ("chat " if kind == "line" else "title ") + shown,
             "priority " + str(t.get("priority", "normal")),
             "prefix " + ("on" if t.get("prefix", kind == "window") else "off")]
+    if uses_console(p, t):
+        bits.append("console first")
     if t.get("class_whitelist"):
         bits.append("class " + "|".join(t["class_whitelist"]))
     if t.get("halfwidth"):

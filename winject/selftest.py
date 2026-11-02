@@ -1,14 +1,16 @@
 """winject selftest: offline checks in a temporary folder.
 
 Touches no window, clipboard, mouse or keyboard, starts no process and sends nothing to Telegram: the dispatcher
-logic runs with a fake sender, a fake alerter and a fake subprocess runner. Of winsend.py only the pure title
-functions are used (match_title / norm_title / Win). The real data folder is never created or changed.
+logic runs with a fake sender, a fake alerter and a fake subprocess runner; the console path (tgterm typing
+into the AI terminal) only with a fake console. Of winsend.py only the pure title functions are used
+(match_title / norm_title / Win). The real data folder is never created or changed.
 """
 import datetime as dt
 import hashlib
 import inspect
 import os
 import shutil
+import subprocess
 import tempfile
 import time
 import types
@@ -74,7 +76,22 @@ def run(base_dir=None):
         t = c.load_targets(p)
         check(list(t) == ["agent"] and t["agent"]["type"] == "window" and t["agent"]["title_from_config"] == "agent_name",
               "default targets: %r" % t)
+        check(t["agent"].get("console") is True, "the shipped agent target types into the terminal first")
         check(c.resolve_title(p, t["agent"]) == ("測試 AI", "config.json agent_name"), c.resolve_title(p, t["agent"]))
+        # console typing only for this computer's AI window (tgterm types into that terminal whatever the title)
+        ag = t["agent"]
+        check(c.uses_console(p, ag) and "console first" in c.describe_target(p, "agent", ag), "uses_console: agent")
+        check(c.uses_console(p, {"type": "window", "title_from_config": "agent_name"}),
+              "an agent target copied before the flag existed still types into the terminal")
+        check(c.uses_console(p, {"type": "window", "title": " 測試  AI ", "console": True}), "stored title = agent_name")
+        for bad in ({"type": "window", "title": "研究助理", "console": True}, {"type": "window", "title": "測試 AI"},
+                    {"type": "line", "title": "測試 AI", "console": True}, dict(ag, console=False), dict(ag, enter=False),
+                    {"type": "window", "title_from_config": "nope", "console": True}):
+            check(not c.uses_console(p, bad), "uses_console must be off for %r" % bad)
+        c.write_json(p.config, {"agent_name": "測試 AI", "token": "", "owner_id": "", "mode": "paste"})
+        check(not c.uses_console(p, ag) and "console first" not in c.describe_target(p, "agent", ag),
+              "config mode paste: never the console path")
+        c.write_json(p.config, {"agent_name": "測試 AI", "token": "", "owner_id": ""})
         check(c.resolve_title(p, {"title_from_config": "missing_key"})[0] is None, "missing config key")
         check(c.resolve_title(p, {"title": "  Untitled   - Notepad "}) == ("Untitled - Notepad", "stored"), "title spaces")
         for bad in ("", "a b", "status", "Status", "ALL", "-x", "_x", "a/b", 'q"', "x" * 41, "tab\t"):
@@ -262,8 +279,10 @@ def run(base_dir=None):
                                      SendFail=FakeFail, send_window=fake_window, send_line=fake_line)
         sender = d.WinsendSender(p, ws=fake)
         tgts = c.load_targets(p)
+        check(sender.console is None and tgts["agent"].get("console") is True,
+              "a sender built around a fake winsend never gets the real console path")
         r = sender("agent", tgts["agent"], {"text": "hi"}, "[cli→agent] hi")
-        check(r == {"ok": True, "detail": "typed into '測試 AI'"}, "adapter ok: %r" % r)
+        check(r == {"ok": True, "detail": "typed into '測試 AI'", "via": "paste"}, "adapter ok: %r" % r)
         check(calls[:3] == ["lock", ("window", "測試 AI", "[cli→agent] hi", True, True), "unlock"],
               "adapter: inside winsend's lock, strict matching during the send: %r" % calls)
         check(fake.match_title is orig_match, "winsend.match_title restored")
@@ -294,6 +313,93 @@ def run(base_dir=None):
               "adapter: unexpected error")
         check(sender("bad", {"type": "sms", "title": "x"}, {"text": "x"}, "x")["kind"] == "bad", "adapter: bad type")
         check(sender("bad", {"title_from_config": "nope"}, {"text": "x"}, "x")["kind"] == "bad", "adapter: no title")
+
+        # ---- console typing first, with a fake console (nothing is typed, no process is started)
+        behaviour["window"] = behaviour["line"] = None
+        consoled, answers = [], []
+
+        def fake_console(text):
+            consoled.append(text)
+            ans = answers.pop(0) if answers else "ok console pid 1"
+            if isinstance(ans, Exception):
+                raise ans
+            return ans
+
+        csender = d.WinsendSender(p, ws=fake, console=fake_console)
+        n = len(calls)
+        r = csender("agent", tgts["agent"], {"text": "x"}, "[cli→agent] 第一行\n第二行")
+        check(r["ok"] and r["via"] == "console" and "console pid 1" in r["detail"] and len(calls) == n
+              and consoled == ["[cli→agent] 第一行\n第二行"], "console ok -> winsend not called: %r" % r)
+        for ans in ("FAIL RuntimeError('agent terminal is not running')", "", "ok empty", "garbage", RuntimeError("x")):
+            answers.append(ans)
+            n = len(calls)
+            r = csender("agent", tgts["agent"], {"text": "x"}, "x")
+            check(r["ok"] and r["via"] == "paste" and r.get("console_error")
+                  and calls[n:] == ["lock", ("window", "測試 AI", "x", True, True), "unlock"],
+                  "console answer %r -> winsend fallback: %r %r" % (ans, r, calls[n:]))
+            if ans == "garbage":
+                check(r["console_error"] == "garbage", "the console answer is kept: %r" % r)
+        answers.append("FAIL AlreadyTyped('Enter failed after the text was typed: x (keys were already typed)')")
+        n = len(calls)
+        r = csender("agent", tgts["agent"], {"text": "x"}, "x")
+        check(not r["ok"] and r["maybe_sent"] is True and len(calls) == n,
+              "keys already in the terminal -> no paste on top, never retried: %r" % r)
+        behaviour["window"] = FakeFail("nothing matches '測試 AI' exactly")
+        answers.append("FAIL RuntimeError('agent terminal is not running')")
+        r = csender("agent", tgts["agent"], {"text": "x"}, "x")
+        check(not r["ok"] and r["kind"] == "missing" and r["maybe_sent"] is False, "both ways fail -> retry later: %r" % r)
+        behaviour["window"] = None
+        n_console = len(consoled)
+        for tgt in ({"type": "window", "title": "Other AI"}, {"type": "window", "title": "Other AI", "console": True},
+                    dict(tgts["family"], console=True), dict(tgts["agent"], console=False),
+                    dict(tgts["agent"], enter=False)):
+            n = len(calls)
+            r = csender("x", tgt, {"text": "x"}, "x")
+            check(r["ok"] and r["via"] == "paste" and len(calls) == n + 3, "winsend only for %r: %r" % (tgt, r))
+        check(len(consoled) == n_console, "no console typing for anything but this computer's AI window")
+        c.write_json(p.config, {"agent_name": "測試 AI", "token": "", "owner_id": "", "mode": "paste"})
+        check(csender("agent", tgts["agent"], {"text": "x"}, "x")["via"] == "paste" and len(consoled) == n_console,
+              "config mode paste -> winsend only")
+        c.write_json(p.config, {"agent_name": "測試 AI", "token": "", "owner_id": ""})
+        # the dispatcher keeps how it went in done.jsonl
+        dpc = d.Dispatcher(p, sender=csender, alerter=lambda text: alerts.append(text) or "sent",
+                           clock=lambda: clock[0], async_alerts=False)
+        for ans, via in (("ok console pid 2", "console"), ("FAIL x", "paste")):
+            answers.append(ans)
+            rv = c.enqueue(p, "agent", "看一下\n第二行", source="cli")
+            nxt = c.pick_next(p, clock[0])
+            check(nxt and nxt[2]["id"] == rv["id"] and dpc.process(*nxt) == "done", "process via %s" % via)
+            last = c.tail_jsonl(p.done, 1)[0]
+            check(last["id"] == rv["id"] and last["via"] == via and (via == "console") == ("console_error" not in last),
+                  "done record via %s: %r" % (via, last))
+        check(consoled[-2:] == ["[cli→agent] 看一下\n第二行"] * 2, "line breaks reach the console path: %r" % consoled[-2:])
+
+        # ---- run_console builds the tgterm command line (fake runner: no process is started)
+        got = {}
+
+        def fake_child(out=b"", err=b"", code=0, exc=None):
+            def run(args, **kw):
+                got["args"], got["kw"] = args, kw
+                if exc:
+                    raise exc
+                return types.SimpleNamespace(returncode=code, stdout=out, stderr=err)
+            return run
+
+        r = d.run_console(p, "第一行\n第二行", runner=fake_child("ok console pid 7\r\n".encode("utf-8")))
+        kw = got["kw"]
+        check(r == "ok console pid 7" and got["args"][0] == control.pythonw()
+              and got["args"][1:] == [p.tgterm, "_inject", "console", "第一行\n第二行"]
+              and kw["creationflags"] == d.DETACHED_PROCESS and kw["env"]["AGENT_SETUP_AGENT_DIR"] == p.agent
+              and kw["env"]["PYTHONUTF8"] == "1" and kw["timeout"] == d.CONSOLE_TIMEOUT and kw["cwd"] == p.agent,
+              "run_console: tgterm _inject console, detached: %r %r" % (r, got))
+        r = d.run_console(p, "x", runner=fake_child(b"FAIL RuntimeError('no')\n", code=1))
+        check(r == "FAIL RuntimeError('no')", "run_console FAIL line: %r" % r)
+        r = d.run_console(p, "x", runner=fake_child(err=b"Traceback ...\nNameError: y\n", code=1))
+        check(r == "FAIL exit 1 NameError: y" and d.CONSOLE_TYPED not in r, "run_console crash: %r" % r)
+        r = d.run_console(p, "x", runner=fake_child(exc=OSError("too long")))
+        check(r.startswith("FAIL could not run") and d.CONSOLE_TYPED not in r, "run_console cannot start: %r" % r)
+        r = d.run_console(p, "x", runner=fake_child(exc=subprocess.TimeoutExpired("x", 1)))
+        check(r.startswith("FAIL") and d.CONSOLE_TYPED in r, "run_console timeout counts as maybe typed: %r" % r)
 
         # ---- text rules
         win, line = {"type": "window"}, {"type": "line"}

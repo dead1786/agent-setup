@@ -1,10 +1,11 @@
 {
-  "_comment": "winject default targets, shipped with the installer and never edited in place. The targets in use are in C:\\AI\\.agent\\winject-data\\targets.json (copied from this file the first time add-target / remove-target runs). type: window | line. title: the whole window title, or title_from_config: a key of C:\\AI\\.agent\\config.json read at send time.",
+  "_comment": "winject default targets, shipped with the installer and never edited in place. The targets in use are in C:\\AI\\.agent\\winject-data\\targets.json (copied from this file the first time add-target / remove-target runs). type: window | line. title: the whole window title, or title_from_config: a key of C:\\AI\\.agent\\config.json read at send time. console: true types straight into this computer's AI terminal (tgterm.py, no focus or clipboard) and pastes only when that does not work.",
   "agent": {
     "type": "window",
     "title_from_config": "agent_name",
     "priority": "high",
     "prefix": true,
+    "console": true,
     "note": "this computer's AI window (its title is config.json agent_name)"
   }
 }

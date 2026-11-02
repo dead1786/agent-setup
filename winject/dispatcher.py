@@ -8,12 +8,16 @@ Each message: take the oldest from queue\\high, else from queue\\normal -> move 
 type it with winsend.py (window: send_window, line: send_line; under winsend's lock Local\\agent-winsend, so a
 one-off winsend or tgterm paste never fights over the focus) -> done.jsonl, or a retry later, or failed.jsonl
 plus a Telegram message to the owner. A message that may already have been typed is never retried.
+This computer's AI window (common.uses_console) is first typed straight into its terminal by `tgterm.py _inject
+console` in a detached child (no focus, no clipboard; tgterm takes the same lock itself); when that does not
+work, winsend pastes it as above. done.jsonl says which way it went (via console / paste).
 A heartbeat thread writes heartbeat.json every 5 s; the main loop's own time is in it too.
 The dispatcher idles while winject-data\\paused or the agent's paused file exists, exits on winject-data\\stop
 (newer than its start) and exits when winsend.py disappears (uninstalled).
 """
 import importlib.util
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -31,6 +35,9 @@ ALERT_COOLDOWN = 600        # at most one Telegram alert per target per 10 minut
 PASTED_NOT_SENT = "pasted into the window but not sent"     # winsend.send_window, focus lost just before Enter
 WINSEND_NEEDS = ("send_window", "send_line", "SendLock", "SendFail", "match_title", "norm_title", "make_dpi_aware",
                  "enum_windows", "target_windows", "line_windows", "line_chat_windows")
+CONSOLE_TYPED = "already typed"         # in tgterm's FAIL line when keys reached the terminal: never paste it again
+CONSOLE_TIMEOUT = 120                   # tgterm waits up to 60 s for the send lock, then types for a few seconds
+DETACHED_PROCESS = 0x00000008
 
 
 def load_winsend(p):
@@ -46,22 +53,65 @@ def load_winsend(p):
     return mod
 
 
-class WinsendSender:
-    """types one message with winsend; returns {"ok", "detail"} or {"ok": False, "reason", "kind", "maybe_sent"}"""
+def run_console(p, text, runner=None):
+    """`tgterm.py _inject console <text>` in a detached child (attaching to the AI's console needs a process
+    without one); its one output line: "ok ..." when typed, else "FAIL ..." """
+    runner = runner or subprocess.run
+    env = dict(os.environ, PYTHONUTF8="1", AGENT_SETUP_AGENT_DIR=p.agent)
+    try:
+        # pythonw: the venv's python.exe is a launcher whose interpreter child would open a console window here
+        r = runner([control.pythonw(), p.tgterm, "_inject", "console", text], cwd=p.agent, env=env,
+                   creationflags=DETACHED_PROCESS, stdin=subprocess.DEVNULL, capture_output=True,
+                   timeout=CONSOLE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return "FAIL no answer from tgterm.py within %d s (keys may be already typed)" % CONSOLE_TIMEOUT
+    except Exception as e:                          # could not start it (e.g. the text is too long for a command line)
+        return "FAIL could not run tgterm.py: %s: %s" % (type(e).__name__, e)
+    out = (r.stdout or b"").decode("utf-8", "replace").strip()
+    err = (r.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+    return out or "FAIL exit %s %s" % (r.returncode, err[-1] if err else "(no output)")
 
-    def __init__(self, p, ws=None):
+
+class WinsendSender:
+    """types one message (this computer's AI window: tgterm's console path first) with winsend;
+    returns {"ok", "detail", "via"} or {"ok": False, "reason", "kind", "maybe_sent"}"""
+
+    def __init__(self, p, ws=None, console=None):
         self.p = p
+        # the real console path only next to the real winsend: a sender built around a fake ws never types
+        self.console = console if console is not None else (None if ws else (lambda text: run_console(p, text)))
         self.ws = ws or load_winsend(p)
         self._orig_match = self.ws.match_title
 
     def __call__(self, name, t, rec, text):
-        ws = self.ws
         kind = t.get("type", "window")
         if kind not in c.TYPES:
             return {"ok": False, "reason": "target %r has an unknown type %r" % (name, kind), "kind": "bad"}
         title, why = c.resolve_title(self.p, t)
         if not title:
             return {"ok": False, "reason": "target %r: %s" % (name, why), "kind": "bad"}
+        console_error = None
+        if self.console and c.uses_console(self.p, t):
+            try:
+                out = str(self.console(text) or "").strip()      # outside winsend's lock: tgterm takes it itself
+            except Exception as e:
+                out = "FAIL %s: %s" % (type(e).__name__, e)
+            if out.startswith("ok ") and out != "ok empty":
+                return {"ok": True, "detail": "typed into the AI terminal (%s)" % out[3:], "via": "console"}
+            if CONSOLE_TYPED in out:
+                return {"ok": False, "reason": "typing straight into the AI terminal stopped halfway: " + out,
+                        "kind": "other", "maybe_sent": True}
+            console_error = c.preview(out, 200) or "(no answer)"
+            c.dlog(self.p, "console typing into %s did not work (%s); pasting instead" % (name, console_error))
+        res = self._winsend(kind, title, t, rec, text)
+        if res.get("ok"):
+            res["via"] = "paste"
+            if console_error:
+                res["console_error"] = console_error
+        return res
+
+    def _winsend(self, kind, title, t, rec, text):
+        ws = self.ws
         strict = c.make_strict_matcher(self._orig_match, ws.norm_title,
                                        t.get("class_whitelist") if kind == "window" else None)
         try:
@@ -201,13 +251,14 @@ class Dispatcher:
         p = self.p
         if result.get("ok"):
             out = dict(rec, state="done", completed=c.now_iso(), result=result.get("detail", ""))
+            out.update((k, result[k]) for k in ("via", "console_error") if result.get(k))
             try:
                 c.append_jsonl(p, p.done, out)
             except OSError as e:                    # it was typed: never leave it where it could be retried
                 self.log("could not write done.jsonl (%s): %s" % (e, c.preview(repr(out), 400)))
             _remove(inflight)
-            self.log("ok id=%s target=%s attempt=%s: %s" % (rec.get("id"), rec.get("target"), rec.get("attempts"),
-                                                           result.get("detail", "")))
+            self.log("ok id=%s target=%s attempt=%s via=%s: %s" % (rec.get("id"), rec.get("target"), rec.get("attempts"),
+                                                                  result.get("via", "?"), result.get("detail", "")))
             return "done"
         reason = result.get("reason") or "unknown error"
         maybe = bool(result.get("maybe_sent"))

@@ -1,7 +1,7 @@
 # tgterm: Telegram <-> the agent's terminal (works the same for Claude Code / Codex / Gemini CLI)
 #   pythonw tgterm.py bridge              forward the owner's Telegram messages into the running agent terminal
 #   python  tgterm.py send "text"         reply to the owner on Telegram   (also: send --file <utf-8 file>, send - for stdin)
-#   python  tgterm.py inject "text"       type one line into the agent terminal and press Enter (test; --mode console|paste)
+#   python  tgterm.py inject "text"       type text into the agent terminal and press Enter (test; --mode console|paste)
 #   python  tgterm.py status              bridge / agent process / agent window check
 #   python  tgterm.py close-window        close the agent window like a user would (watchdog test)
 #   pythonw tgterm.py watchdog            reopen the agent window / restart the bridge if gone (Task Scheduler, every minute)
@@ -18,8 +18,9 @@
 #   python  tgterm.py rules-record --rules R --installed I            remember each managed section's hash
 # AGENT_SETUP_AGENT_DIR=<folder> points at another install folder (update.ps1 runs a downloaded tgterm.py this way).
 # Typing into the terminal (config "mode"):
-#   console  write key events into the agent console's input buffer (WriteConsoleInputW): no focus change, no clipboard
-#   paste    winject style: bring the agent window forward, paste with Ctrl+V, press Enter, hand focus back
+#   console  write key events into the agent console's input buffer (WriteConsoleInputW): no focus change, no clipboard;
+#            line breaks kept (one bracketed paste, then Enter twice); Codex gets one line
+#   paste    winject style: bring the agent window forward, paste one line with Ctrl+V, press Enter, hand focus back
 import ctypes, hashlib, json, os, re, shutil, subprocess, sys, threading, time, traceback, urllib.error, urllib.parse
 import urllib.request, uuid
 from ctypes import wintypes
@@ -254,29 +255,72 @@ def agent_pid():
     return pid if info[1] <= written + 2 else None
 
 
-def records_for(text, enter):
+class AlreadyTyped(RuntimeError):
+    """keys already reached the agent's input box: the caller must not type the text again (winject checks the note)"""
+    def __init__(self, msg):
+        super().__init__(msg + " (keys were already typed)")
+
+
+def _key(ch="", vk=0, scan=0):
     recs = []
-    units = text.encode("utf-16-le")
-    for i in range(0, len(units), 2):
-        ch = units[i:i + 2].decode("utf-16-le", errors="surrogatepass")
-        for down in (True, False):
-            r = INPUT_RECORD()
-            r.EventType = KEY_EVENT
-            r.Event.bKeyDown = down
-            r.Event.wRepeatCount = 1
-            r.Event.UnicodeChar = ch
-            recs.append(r)
-    if enter:
-        for down in (True, False):
-            r = INPUT_RECORD()
-            r.EventType = KEY_EVENT
-            r.Event.bKeyDown = down
-            r.Event.wRepeatCount = 1
-            r.Event.wVirtualKeyCode = VK_RETURN
-            r.Event.wVirtualScanCode = SCAN_RETURN
-            r.Event.UnicodeChar = "\r"
-            recs.append(r)
+    for down in (True, False):
+        r = INPUT_RECORD()
+        r.EventType = KEY_EVENT
+        r.Event.bKeyDown = down
+        r.Event.wRepeatCount = 1
+        r.Event.wVirtualKeyCode = vk
+        r.Event.wVirtualScanCode = scan
+        r.Event.UnicodeChar = ch
+        recs.append(r)
     return recs
+
+
+def enter_records():
+    return _key("\r", VK_RETURN, SCAN_RETURN)
+
+
+def _chars(s):
+    recs = []
+    units = s.encode("utf-16-le")
+    for i in range(0, len(units), 2):
+        recs += _key(units[i:i + 2].decode("utf-16-le", errors="surrogatepass"))
+    return recs
+
+
+def clean_lines(text):
+    """line breaks become \\n and tabs stay; every other control character (ESC included) becomes a space"""
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    return "".join(ch if ch in "\t\n" or not (ch < " " or "\x7f" <= ch <= "\x9f") else " " for ch in text)
+
+
+PASTE_START, PASTE_END = "\x1b[200~", "\x1b[201~"
+OLD_STYLE = ("codex", "gemini")                        # bracketed paste verified on Claude Code only (11-02)
+END_RECS = 2 * len(PASTE_END)                           # records of the closing marker, written in one piece
+
+
+def records_for(text, kind=None):
+    """key records for the text. Claude Code: one bracketed paste, each line break an Enter inside it
+    (11-02: typed text was taken as a paste and the Enter after it swallowed). Codex on Windows has no bracketed
+    paste (ESC would reach it as a key) and Antigravity was never tested with it: one line, as before."""
+    if kind in OLD_STYLE:
+        return _chars(one_line(text))
+    recs = _key(PASTE_START[0]) + _chars(PASTE_START[1:])
+    for i, line in enumerate(clean_lines(text).split("\n")):
+        if i:
+            recs += enter_records()
+        recs += _chars(line)
+    return recs + _key(PASTE_END[0]) + _chars(PASTE_END[1:])
+
+
+def _chunks(recs, size=256):
+    """write-sized pieces; the last END_RECS records never straddle two writes (a lone ESC would act as a key)"""
+    i, n = 0, len(recs)
+    while i < n:
+        j = min(i + size, n)
+        if n - END_RECS < j < n:
+            j = n - END_RECS
+        yield recs[i:j]
+        i = j
 
 
 def write_console(pid, recs):
@@ -288,25 +332,42 @@ def write_console(pid, recs):
         if not h or h == INVALID_HANDLE:
             raise OSError("open CONIN$ failed: %s" % ctypes.get_last_error())
         try:
-            for i in range(0, len(recs), 256):
-                chunk = recs[i:i + 256]
+            done = 0
+            for chunk in _chunks(recs):
                 arr = (INPUT_RECORD * len(chunk))(*chunk)
                 n = DWORD(0)
-                if not k32.WriteConsoleInputW(h, arr, len(chunk), ctypes.byref(n)):
-                    raise OSError("WriteConsoleInputW failed: %s" % ctypes.get_last_error())
+                if not k32.WriteConsoleInputW(h, arr, len(chunk), ctypes.byref(n)) or n.value != len(chunk):
+                    err = "WriteConsoleInputW failed: %s" % ctypes.get_last_error()
+                    raise AlreadyTyped(err) if done or n.value else OSError(err)
+                done += len(chunk)
         finally:
             k32.CloseHandle(h)
     finally:
         k32.FreeConsole()
 
 
-def inject_console(text):
+def inject_console(text, kind=None):
     pid = agent_pid()
     if not pid:
         raise RuntimeError("agent terminal is not running")
-    write_console(pid, records_for(text, enter=False))
-    time.sleep(0.6)                                     # let the TUI take the text before Enter
-    write_console(pid, records_for("", enter=True))
+    recs = records_for(text, kind)
+    write_console(pid, recs)
+    try:
+        if kind in OLD_STYLE:
+            time.sleep(0.6)                             # let the TUI take the text before Enter
+            write_console(pid, enter_records())
+            return "console pid %s" % pid
+        time.sleep(1.5 + min(len(recs), 40000) / 20000)   # let the TUI finish taking the paste before Enter
+        write_console(pid, enter_records())
+    except AlreadyTyped:
+        raise
+    except Exception as e:
+        raise AlreadyTyped("Enter failed after the text was typed: %s" % e)
+    time.sleep(1.0)
+    try:
+        write_console(pid, enter_records())             # covers a swallowed first Enter; on an empty prompt it does nothing
+    except Exception as e:
+        return "console pid %s (second Enter failed: %s)" % (pid, e)
     return "console pid %s" % pid
 
 
@@ -448,17 +509,7 @@ def press_escape(cfg):
     pid = agent_pid()
     if not pid:
         raise RuntimeError("agent terminal is not running")
-    recs = []
-    for down in (True, False):
-        r = INPUT_RECORD()
-        r.EventType = KEY_EVENT
-        r.Event.bKeyDown = down
-        r.Event.wRepeatCount = 1
-        r.Event.wVirtualKeyCode = VK_ESCAPE
-        r.Event.wVirtualScanCode = 0x01
-        r.Event.UnicodeChar = "\x1b"
-        recs.append(r)
-    write_console(pid, recs)
+    write_console(pid, _key("\x1b", VK_ESCAPE, 0x01))
     return "console pid %s" % pid
 
 
@@ -469,13 +520,13 @@ def one_line(text):
 
 
 def inject(cfg, text, mode=None):
-    text = one_line(text)
-    if not text:
+    if not one_line(text):
         return "empty"
     mode = mode or cfg.get("mode", "console")
     if mode == "paste":
-        return inject_paste(cfg.get("agent_name", ""), text)
-    return with_winsend_lock(inject_console, text)
+        return inject_paste(cfg.get("agent_name", ""), one_line(text))
+    # console keeps line breaks (inside a bracketed paste; see records_for)
+    return with_winsend_lock(inject_console, text, cfg.get("ai"))
 
 
 # ---------------------------------------------------------------- screenshots, voice
@@ -1953,9 +2004,32 @@ def daily_update_check(cfg):
 # ---------------------------------------------------------------- CLI
 def selftest():
     assert ctypes.sizeof(INPUT_RECORD) == 20, ctypes.sizeof(INPUT_RECORD)
-    recs = records_for("測試a😀", enter=True)
-    assert len(recs) == (5 + 1) * 2, len(recs)          # 測 試 a + emoji as 2 UTF-16 units, each down+up, plus Enter
-    assert recs[-2].Event.wVirtualKeyCode == VK_RETURN and recs[-2].Event.bKeyDown
+    # console typing: records are only built here, never written
+
+    def typed(recs):
+        assert len(recs) % 2 == 0 and all(recs[i].Event.bKeyDown and not recs[i + 1].Event.bKeyDown
+                                          and recs[i].Event.UnicodeChar == recs[i + 1].Event.UnicodeChar
+                                          for i in range(0, len(recs), 2)), "down/up pairs"
+        for r in recs:
+            enter = r.Event.wVirtualKeyCode == VK_RETURN
+            assert enter == (r.Event.UnicodeChar == "\r") and (r.Event.wVirtualScanCode == SCAN_RETURN) == enter
+        return "".join(r.Event.UnicodeChar for r in recs if r.Event.bKeyDown)
+    recs = records_for("測試a😀")
+    assert len(recs) == (5 + 12) * 2, len(recs)         # 測 試 a + emoji as 2 UTF-16 units, plus ESC[200~ and ESC[201~
+    assert typed(recs) == "\x1b[200~測試a\ud83d\ude00\x1b[201~", repr(typed(recs))
+    got = typed(records_for("\n第一行\r\n第二行\n\n第三\x1b行\t尾\x07\x7f\x85\r\n"))
+    assert got == "\x1b[200~第一行\r第二行\r\r第三 行\t尾   \x1b[201~", repr(got)   # line breaks -> Enter, controls -> space
+    assert got.count("\x1b") == 2 and "\\" not in got and got.count("\r") == 3, repr(got)
+    assert typed(records_for("a\\b")) == "\x1b[200~a\\b\x1b[201~"            # the user's own backslash stays, none added
+    assert typed(records_for("a\n b\x1b", "codex")) == "a b", typed(records_for("a\n b\x1b", "codex"))
+    assert typed(records_for("", None)) == "\x1b[200~\x1b[201~" and typed(enter_records()) == "\r"
+    assert clean_lines("\r\na\rb\r\n\x00\tc\n\n") == "a\nb\n \tc"
+    for n in (1, 12, 200, 256, 260, 268, 517, 1000):
+        recs = [object()] * n
+        parts = list(_chunks(recs))
+        assert sum(map(len, parts)) == n and all(0 < len(x) <= 256 for x in parts), (n, list(map(len, parts)))
+        assert len(parts[-1]) >= min(n, END_RECS), (n, list(map(len, parts)))      # the closing ESC[201~ stays whole
+    assert "keys were already typed" in repr(AlreadyTyped("Enter failed"))
     assert one_line("a\nb\r\n  c\x1bd") == "a b c d", one_line("a\nb\r\n  c\x1bd")
     import tempfile
     d = tempfile.mkdtemp()
@@ -2087,10 +2161,10 @@ def main(argv):
     elif cmd == "_inject":
         try:
             how = inject(load_cfg(), argv[3], argv[2] or None)
-            log("test inject (%s): %s" % (how, argv[3][:80]))
+            log("inject (%s): %s" % (how, one_line(argv[3])[:80]))
             print("ok " + how)
         except Exception as e:
-            log("test inject failed: %r" % e)
+            log("inject failed: %r" % e)
             print("FAIL %r" % e)
             return 1
     elif cmd == "status":
