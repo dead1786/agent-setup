@@ -53,12 +53,18 @@ def norm(p):
 QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'')
 MESSAGE_TOOLS = re.compile(r'^\s*(?:&\s*)?["\']?[^"\'\s]*python[w]?(?:\.exe)?["\']?\s+(?:-X\s+utf8\s+)?["\']?[^"\'\s]*'
                            r'(?:tgterm|winsend)\.py["\']?\s+(?:send|remind|window|line|inject)\b', re.I)
+# the AI calling its own message tools (python … tgterm.py send …): the call itself is not "touching" tgterm.py.
+# Only at the start of a statement, so `tee python C:/AI/.agent/tgterm.py send` (tee writes every file it is given) still counts.
+MESSAGE_CALL = re.compile(r'(?:^|(?<=[;&|\n\r({]))\s*(?:&\s*)?["\']?[^"\'\s]*python[w]?(?:\.exe)?["\']?\s+(?:-X\s+utf8\s+)?'
+                          r'["\']?[^"\'\s]*(?:tgterm|winsend)\.py["\']?(?=\s+(?:send|remind|window|line|inject)\b)', re.I | re.M)
+# command substitution runs code even inside double quotes ("$(…)" in PowerShell and bash, `…` in bash)
+SUBSTITUTION = re.compile(r'\$\(|`[^`]*`')
 SPLIT = re.compile(r'&&|\|\||;|\r?\n|(?<![|])\|(?![|])')
 KILL_NAMES = r'(?:python[w0-9.]*|py|node|claude|codex|agy|antigravity\w*|windowsterminal|wt|openconsole|conhost|powershell|pwsh|cmd)'
 NET = r'(?:\bcurl(?:\.exe)?\b|\bwget\b|\binvoke-webrequest\b|\biwr\b|\binvoke-restmethod\b|\birm\b|\bstart-bitstransfer\b|net\.webclient|\bscp\b|\bsftp\b|\brsync\b|\bftp\b)'
 WRITE_VERB = re.compile(r'(?<![0-9&])>{1,2}(?!\s*(?:&|\$null|nul\b|/dev/null))|\b(?:set-content|add-content|out-file|clear-content|'
                         r'remove-item|move-item|copy-item|rename-item|new-item|tee|tee-object|attrib|icacls|takeown)\b|'
-                        r'(?:^|[\s;&|(])(?:sc|ac|ri|rm|del|erase|mv|move|cp|copy|ren|rename|rd|rmdir)\s|\bsed\s+-i|'
+                        r'(?:^|[\s;&|(`])(?:sc|ac|ri|rm|del|erase|mv|move|cp|copy|ren|rename|rd|rmdir)\s|\bsed\s+-i|'
                         r'\.write\(|json\.dump|writealltext|writeallbytes|\bunlink\(|\bremove\(|rmtree', re.I)
 SAFE_DELETE = re.compile(r'(?:^|/)(?:node_modules|__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.cache|\.next|\.turbo|'
                          r'dist|build|out|coverage|\.venv-tmp)/?$|^(?:/tmp|\$env:temp|%temp%|\$temp)(?:/|$)|/appdata/local/temp/|'
@@ -163,7 +169,7 @@ def delete_targets(seg):
 def check_shell(cmd):
     """return a reason string when the shell command should be blocked"""
     text = cmd if isinstance(cmd, str) else " ".join(map(str, cmd or []))
-    if MESSAGE_TOOLS.search(text) and not re.search(r'&&|\|\||;|\n', QUOTED.sub('""', text)):
+    if MESSAGE_TOOLS.search(text) and not re.search(r'&&|\|\||;|\n', QUOTED.sub('""', text)) and not SUBSTITUTION.search(text):
         text = QUOTED.sub('""', text)                  # message text may mention anything
     flat = text.replace("\\", "/")
     for seg in segments(flat):
@@ -187,7 +193,10 @@ def check_shell(cmd):
         return "碰到存密碼的檔案。" + SECRETS_HINT
     low = flat.lower()
     if WRITE_VERB.search(flat):
-        if re.search(r'(?:^|[/\s"\'])' + AGENT_FILES, low) or re.search(r'c:/ai/\.agent/py\b|c:/ai/\.agent["\'\s]*$', low):
+        # calling the message tools is fine even next to a file write (e.g. a long message saved to a temp file
+        # and sent with --file); an agent file named anywhere else in the command still counts
+        rest = MESSAGE_CALL.sub(" agent-call ", flat).lower()
+        if re.search(r'(?:^|[/\s"\'])' + AGENT_FILES, rest) or re.search(r'c:/ai/\.agent/py\b|c:/ai/\.agent["\'\s]*$', rest):
             return "修改或刪除 AI 自己的運作檔案（Telegram 連線、安全防護、啟動腳本）"
         if re.search(r'\.(?:codex|gemini/config)/hooks\.json|\.claude/settings(?:\.local)?\.json', low):
             return "修改安全防護設定"
@@ -445,6 +454,12 @@ def selftest():
         ("Bash", {"command": "python C:\\AI\\.agent\\tgterm.py update --source C:\\AI\\mine"}),
         ("PowerShell", {"command": "$env:AGENT_UPDATE_SOURCE='C:\\AI\\mine'; python C:\\AI\\.agent\\tgterm.py update"}),
         ("apply_patch", {"command": "*** Begin Patch\n*** Update File: C:\\Users\\me\\.codex\\hooks.json\n@@\n-x\n+y\n*** End Patch"}),
+        # the message-tool call must not hide a write to the agent's own files
+        ("Bash", {"command": "& C:\\AI\\.agent\\py\\Scripts\\python.exe C:\\AI\\.agent\\tgterm.py send \"x\"; Set-Content C:\\AI\\.agent\\guard.py 'y'"}),
+        ("Bash", {"command": "python C:\\AI\\.agent\\tgterm.py send \"$(Remove-Item C:\\AI\\.agent\\guard.py)\""}),
+        ("Bash", {"command": "python C:/AI/.agent/tgterm.py send \"`rm C:/AI/.agent/guard.py`\""}),
+        ("Bash", {"command": "echo evil | tee python C:/AI/.agent/tgterm.py send"}),
+        ("PowerShell", {"command": "$p = 'C:\\AI\\.agent\\run-agent.ps1'\nSet-Content $p 'x'\n& C:\\AI\\.agent\\py\\Scripts\\python.exe C:\\AI\\.agent\\tgterm.py send \"ok\""}),
     ]
     allow = [
         ("Bash", {"command": "git log --format=%H -3"}),
@@ -481,6 +496,13 @@ def selftest():
         ("Bash", {"command": "git checkout main"}),
         ("Read", {"file_path": "C:\\Users\\me\\.ssh\\config"}),
         ("Read", {"file_path": "C:\\Users\\me\\.ssh\\id_ed25519.pub"}),
+        # Codex on Windows (11-03): long message in a here-string, saved to a temp file, sent with --file
+        ("Bash", {"command": "$message = @'\n主人您好！需要提醒時，說「幾點提醒我……」即可。\n1. 您目前的工作是什麼？\n'@\n"
+                             "$f = Join-Path $env:TEMP 'agent-msg.txt'\nSet-Content -LiteralPath $f -Value $message -Encoding UTF8\n"
+                             "& C:\\AI\\.agent\\py\\Scripts\\python.exe C:\\AI\\.agent\\tgterm.py send --file $f"}),
+        ("Bash", {"command": "Set-Content -LiteralPath C:\\AI\\memory\\owner.md -Value '主人資料' -Encoding UTF8; "
+                             "& 'C:\\AI\\.agent\\py\\Scripts\\python.exe' 'C:\\AI\\.agent\\tgterm.py' send \"記好了\""}),
+        ("Bash", {"command": "echo hi > C:/AI/memory/a.md && /c/AI/.agent/py/Scripts/python.exe C:/AI/.agent/tgterm.py send \"done\""}),
     ]
     agy_block = [
         {"name": "run_command", "args": {"CommandLine": "Remove-Item C:\\Users\\me\\Documents -Recurse -Force"}},

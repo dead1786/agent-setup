@@ -892,12 +892,20 @@ def open_agent_window(cfg):
     ps = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", os.path.join(BASE, "run-agent.ps1")]
     root = cfg.get("root", r"C:\AI")
     wt = shutil.which("wt.exe")
+    if not wt:
+        # the Store alias is not always on PATH for the watchdog (11-03: a PC opened the AI in a plain console,
+        # and the AI then renamed the window); it still lives here when Windows Terminal is installed
+        alias = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WindowsApps", "wt.exe")
+        wt = alias if os.path.lexists(alias) else None
     if wt:
         # Windows Terminal keeps this title no matter what the AI prints
-        subprocess.Popen([wt, "-w", "new", "--title", cfg.get("agent_name", "Agent"), "--suppressApplicationTitle", "-d", root] + ps)
-        return "Windows Terminal"
+        try:
+            subprocess.Popen([wt, "-w", "new", "--title", cfg.get("agent_name", "Agent"), "--suppressApplicationTitle", "-d", root] + ps)
+            return "Windows Terminal"
+        except OSError as e:
+            log("wt.exe failed (%r): opening a plain console instead" % e, WATCHDOG_LOG)
     subprocess.Popen(ps, cwd=root, creationflags=CREATE_NEW_CONSOLE)
-    return "console"
+    return "console (no Windows Terminal: the AI may rename the window)"
 
 
 def handoff_guard():
