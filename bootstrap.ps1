@@ -38,13 +38,13 @@ $TaskName  = 'agent-watchdog'
 # the remote helper's Claude session (same account) that receives the setup report; it renames itself to this with /rename
 $Coordinator = if ($env:AGENT_SETUP_COORDINATOR) { $env:AGENT_SETUP_COORDINATOR } else { 'agent-coordinator' }
 # helper files, pinned to one commit and checked by SHA-256 (a CDN cache can never hand out another version)
-$PinCommit = '8208035617d9c5044a944faeccec94a82988d654'
+$PinCommit = 'ef925316685d3c9c702aceef039a0741b4137f94'
 $PinFiles  = [ordered]@{
-    'tgterm.py'                  = 'f5b7e53ebb36a25df128e1d38dcdae8a75e8bebfa372759281114ce9f437d6b8'
+    'tgterm.py'                  = '402624a559961787cebb666fcc71c9abc14127dc18d23ebd574c7d41dcd9f71a'
     'winsend.py'                 = '0089b099a5196819cb891a6339dc03508f23204743adaff4517979e8295e5fa1'
     'skills/winsend/SKILL.md'    = '1f52e2fc29145ab7fa1ca4ac1a39eac9910b5b49306cce2716e452ffd7ada891'
     'skills/memory-rag/SKILL.md' = '21a521973b965eb624b0a1853e01299aefadbc1a2d793ca3bd3ac8cd6fb0de55'
-    'guard.py'                   = '1dd62d221eff3f5c4f77c735bd3433ec459b558608ca4b7302228754c3bb7f5f'
+    'guard.py'                   = '71b6ad7cb52a3b4994c9930c3bd3b1fa76f71972849ffadf504381ead068fd6e'
     'winject/__init__.py'        = 'f25abb6cb808cdcde896f4980571bd33f15adf8c2faec6fa39ff178f9c7c8153'
     'winject/common.py'          = '6aeafb77f1b54e2e01f38491199287ed8d83dc370382234b7c21ba1ac3878426'
     'winject/control.py'         = 'e8efc0c21eae168f82f494dc19dedd8b64a93f0f4a88a7c2cda208adedf10eb5'
@@ -681,6 +681,13 @@ $agentDir = '__AGENTDIR__'; $py = '__PY__'; $tgterm = Join-Path $agentDir 'tgter
 $results = New-Object System.Collections.Specialized.OrderedDictionary
 function Section($t) { Write-Output ''; Write-Output ('### ' + $t) }
 function Result($key, $ok, $detail) { $results[$key] = $(if ($ok) { 'PASS' } else { 'FAIL' }) + $(if ($detail) { '  ' + $detail } else { '' }) }
+function Warn($key, $detail) { $results[$key] = 'WARN' + $(if ($detail) { '  ' + $detail } else { '' }) }
+# the watchdog found no Windows Terminal: the AI window is a plain console and the AI may rename it (Telegram still works by PID)
+function PlainConsole {
+    $opened = @(Get-Content (Join-Path $agentDir 'watchdog.log') -Encoding UTF8 -ErrorAction SilentlyContinue | Where-Object { $_ -match 'opened agent window' })
+    ($opened.Count -gt 0) -and ($opened[-1] -match 'opened agent window \(console')
+}
+$titleNote = '沒有用 Windows Terminal 開（找不到 wt.exe），AI 會自己改視窗標題；Telegram 收發不受影響'
 function Tgterm { & $py $tgterm @args 2>&1 | ForEach-Object { [string]$_ } }
 function Status { $s = @{}; foreach ($l in (Tgterm status)) { if ($l -match '^([a-z_]+)=(.*)$') { $s[$Matches[1]] = $Matches[2] } }; $s }
 
@@ -755,13 +762,14 @@ Section 'AI window + bridge'
 $s = Status
 foreach ($k in $s.Keys) { Write-Output ($k + '=' + $s[$k]) }
 Result 'AI window running' ($s.agent_pid -match '^\d+$') ('pid ' + $s.agent_pid)
-Result 'window title = AI name' ([int]$s.windows_titled -ge 1) ('windows titled ' + $name + ': ' + $s.windows_titled)
+if ([int]$s.windows_titled -ge 1 -or -not (PlainConsole)) { Result 'window title = AI name' ([int]$s.windows_titled -ge 1) ('windows titled ' + $name + ': ' + $s.windows_titled) }
+else { Warn 'window title = AI name' $titleNote }
 if ($tg) { Result 'telegram bridge' ($s.bridge_running -eq 'True') '' }
 Write-Output '--- watchdog.log'
 Get-Content (Join-Path $agentDir 'watchdog.log') -Tail 5 -Encoding UTF8 -ErrorAction SilentlyContinue
 if ($tg) { Write-Output '--- tgterm.log'; Get-Content (Join-Path $agentDir 'tgterm.log') -Tail 8 -Encoding UTF8 -ErrorAction SilentlyContinue }
 
-function Test-Inject($mode) {
+function Test-Inject($mode, $seconds = 180) {
     $script:injectOk = $false
     $since = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
     $file = Join-Path $agentDir 'inject-test.txt'
@@ -771,7 +779,7 @@ function Test-Inject($mode) {
     $out = (Tgterm 'inject' '--mode' $mode $msg) -join ' '
     Write-Output ('inject ' + $mode + ': ' + $out)
     if ($out -notmatch '^ok') { return }
-    for ($i = 1; $i -le 36; $i++) {
+    for ($i = 1; $i -le [int]($seconds / 5); $i++) {
         Start-Sleep -Seconds 5
         if ($tg) {
             $hit = Get-Content (Join-Path $agentDir 'tgterm.log') -Encoding UTF8 -ErrorAction SilentlyContinue |
@@ -779,19 +787,39 @@ function Test-Inject($mode) {
         } else { $hit = Test-Path $file }
         if ($hit) { Write-Output ('AI acted after ' + (5 * $i) + 's'); $script:injectOk = $true; return }
     }
-    Write-Output 'AI did not act within 180s'
+    Write-Output ('AI did not act within ' + $seconds + 's')
 }
 
 if (-not $SkipInject) {
     Section 'inject test (types a test message into the AI window)'
     $pidFile = Join-Path $agentDir 'agent.pid'
-    if (Test-Path $pidFile) {
+    $interactive = $false
+    try { $interactive = -not [Console]::IsInputRedirected } catch {}
+    if ($interactive) {
+        # a first start can stop on a sign-in, trust or what's-new screen: the test message would be lost there
+        Write-Host ''
+        Write-Host ('接下來要測試「把字送進 AI 視窗」。請先看「' + $name + '」視窗：') -ForegroundColor Yellow
+        Write-Host '  如果畫面要你登入、信任資料夾、選模型或按任何鍵，先在那個視窗做完，直到看到可以打字的輸入框。' -ForegroundColor Yellow
+        Write-Host '  好了回到這個視窗按 Enter（3 分鐘內沒按會自動開始測試）。' -ForegroundColor Yellow
+        try { while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) } } catch {}
+        $deadline = (Get-Date).AddMinutes(3)
+        while ((Get-Date) -lt $deadline) {
+            $pressed = $false
+            try { if ([Console]::KeyAvailable -and [Console]::ReadKey($true).Key -eq 'Enter') { $pressed = $true } } catch { $pressed = $true }
+            if ($pressed) { break }
+            Start-Sleep -Milliseconds 200
+        }
+    } elseif (Test-Path $pidFile) {
         $age = ((Get-Date) - (Get-Item $pidFile).LastWriteTime).TotalSeconds
         if ($age -lt 45) { Start-Sleep -Seconds ([int](45 - $age)) }   # let a freshly opened AI finish starting
     }
     $cfg = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
     $mode = if ($cfg.mode) { [string]$cfg.mode } else { 'console' }
     Test-Inject $mode
+    if (-not $script:injectOk) {
+        Write-Output ('mode ' + $mode + ': no answer yet; typing the test message once more (the first one may only have closed a start-up screen)')
+        Test-Inject $mode 120
+    }
     if (-not $script:injectOk) {
         $other = if ($mode -eq 'paste') { 'console' } else { 'paste' }
         Write-Output ('mode ' + $mode + ' did not work; trying ' + $other)
@@ -803,7 +831,13 @@ if (-not $SkipInject) {
             $mode = $other
         }
     }
-    Result 'inject -> AI acted' $script:injectOk ('mode ' + $mode)
+    if (-not $script:injectOk) {
+        Write-Output '--- guard.log (actions the safety guard blocked)'
+        Get-Content (Join-Path $agentDir 'guard.log') -Tail 5 -Encoding UTF8 -ErrorAction SilentlyContinue
+        Write-Output '--- tgterm.log'
+        Get-Content (Join-Path $agentDir 'tgterm.log') -Tail 8 -Encoding UTF8 -ErrorAction SilentlyContinue
+    }
+    Result 'inject -> AI acted' $script:injectOk $(if ($script:injectOk) { 'mode ' + $mode } else { 'mode ' + $mode + '：AI 沒回，多半是還沒登入或卡在畫面上（見上面 log）' })
 }
 
 if (-not $SkipWatchdog) {
@@ -824,7 +858,8 @@ if (-not $SkipWatchdog) {
         if ($after) {
             Start-Sleep -Seconds 3
             $s2 = Status
-            Result 'reopened title = AI name' ([int]$s2.windows_titled -ge 1) ('windows titled ' + $name + ': ' + $s2.windows_titled)
+            if ([int]$s2.windows_titled -ge 1 -or -not (PlainConsole)) { Result 'reopened title = AI name' ([int]$s2.windows_titled -ge 1) ('windows titled ' + $name + ': ' + $s2.windows_titled) }
+            else { Warn 'reopened title = AI name' $titleNote }
         }
     }
 }
@@ -832,7 +867,8 @@ if (-not $SkipWatchdog) {
 Section 'SUMMARY'
 foreach ($k in $results.Keys) { Write-Output ($k.PadRight(26) + $results[$k]) }
 $fails = @($results.Values | Where-Object { $_ -like 'FAIL*' }).Count
-Write-Output ('TOTAL ' + $results.Count + ' checks, ' + $fails + ' failed')
+$warns = @($results.Values | Where-Object { $_ -like 'WARN*' }).Count
+Write-Output ('TOTAL ' + $results.Count + ' checks, ' + $fails + ' failed' + $(if ($warns) { ', ' + $warns + ' warning(s)' } else { '' }))
 '@
 $map = @{ '__AI__' = $ai; '__NAME__' = $agentName; '__TG__' = $(if ($tg) { '$true' } else { '$false' }); '__AGENTDIR__' = $AgentDir
     '__PY__' = $Py; '__MCPDIR__' = $McpDir; '__RULES__' = $RulesPath; '__ROOT__' = $Root; '__TASK__' = $TaskName
@@ -1006,7 +1042,10 @@ if ($DryRun) {
     Say ''
     Say '檢查完成：上面 SUMMARY 全部 PASS 就是裝好了，可以關閉這個視窗。' 'Green'
     Say '   AI 助理安裝 by Kai' 'DarkGray'
-    Say '若有 FAIL：重新貼一次安裝指令即可（會問要不要沿用上次的答案，按 Enter 就好）。' 'Yellow'
+    Say 'WARN 只是提醒，不影響使用。' 'DarkGray'
+    Say '若只有「inject -> AI acted」FAIL：多半是 AI 還沒登入或卡在畫面上。先到 AI 視窗處理好，再貼這行重新檢查（不用重裝）：' 'Yellow'
+    Say '  cd ~\agent-setup; powershell -ExecutionPolicy Bypass -File .\verify.ps1' 'Yellow'
+    Say '其他 FAIL：重新貼一次安裝指令即可（會問要不要沿用上次的答案，按 Enter 就好）。' 'Yellow'
 }
 } finally {
     # never leave the watchdog paused (if setup stopped early, the previous install keeps working)
