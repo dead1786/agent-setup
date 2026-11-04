@@ -445,7 +445,8 @@ if ($NeedClaude) {
             $script:McpPre = $true; Say '    已有自己的 windows-mcp，保留不動' 'DarkGray'; return
         }
         if ($listed -match 'windows-mcp') { cmd /c "claude mcp remove windows-mcp --scope user >nul 2>&1" }
-        claude mcp add windows-mcp --scope user --transport stdio --env ANONYMIZED_TELEMETRY=false -- $UvExe @McpArgs; Check 'claude mcp add'
+        # '--' must be quoted: when claude is the npm shim (claude.ps1), PowerShell eats a bare -- and claude then sees --directory
+        claude mcp add windows-mcp --scope user --transport stdio --env ANONYMIZED_TELEMETRY=false '--' $UvExe @McpArgs; Check 'claude mcp add'
     }
 }
 if ($ai -eq 'codex') {
