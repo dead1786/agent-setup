@@ -1,6 +1,7 @@
 # tgterm: Telegram <-> the agent's terminal (works the same for Claude Code / Codex / Gemini CLI)
 #   pythonw tgterm.py bridge              forward the owner's Telegram messages into the running agent terminal
-#   python  tgterm.py send "text"         reply to the owner on Telegram   (also: send --file <utf-8 file>, send - for stdin)
+#   python  tgterm.py send "text"         reply to the owner on Telegram   (also: send --file <utf-8 file>, send - for stdin;
+#                                         send --photo|--doc|--video <path> [caption]); goes to the owner's current topic
 #   python  tgterm.py inject "text"       type text into the agent terminal and press Enter (test; --mode console|paste)
 #   python  tgterm.py status              bridge / agent process / agent window check
 #   python  tgterm.py close-window        close the agent window like a user would (watchdog test)
@@ -21,6 +22,10 @@
 #   console  write key events into the agent console's input buffer (WriteConsoleInputW): no focus change, no clipboard;
 #            line breaks kept (one bracketed paste, then Enter twice); Codex gets one line
 #   paste    winject style: bring the agent window forward, paste one line with Ctrl+V, press Enter, hand focus back
+# Telegram extras (config keys; the owner flips them with /stream and /topics):
+#   stream   default off: `send` first grows the reply in a draft bubble (sendMessageDraft, ~2.5 s), then sends it
+#   topics   default on: replies go to the private-chat topic the owner wrote in last (topic mode is turned on by the
+#            owner in @BotFather; without it, or outside a topic, nothing changes)
 import ctypes, hashlib, json, os, re, shutil, subprocess, sys, threading, time, traceback, urllib.error, urllib.parse
 import urllib.request, uuid
 from ctypes import wintypes
@@ -37,13 +42,15 @@ INBOX = os.path.join(BASE, "tg-inbox")
 LAST_SENT = os.path.join(BASE, "last-sent")            # time of the latest reply to Telegram
 FRESH = os.path.join(BASE, "fresh-start")              # next AI start opens a new conversation
 REMINDERS = os.path.join(BASE, "reminders.json")
+THREAD = os.path.join(BASE, "tg-thread.json")          # the topic of the owner's latest message (private-chat topics)
 MUTEX = "Local\\agent-tgterm-bridge"
 # Claude Code's manual sign-in redirect (MANUAL_REDIRECT_URL in its source): the page shows a code to paste back
 MANUAL_REDIRECT = "https://platform.claude.com/oauth/code/callback"
 DETACHED_PROCESS, CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW = 0x8, 0x10, 0x200, 0x08000000
 
 
-def log(msg, path=LOG):
+def log(msg, path=None):
+    path = path or LOG                                  # looked up now, so the selftest can point it at a temp file
     try:
         if os.path.exists(path) and os.path.getsize(path) > 1_000_000:
             os.replace(path, path + ".1")
@@ -76,16 +83,24 @@ def load_cfg():
 
 
 # ---------------------------------------------------------------- Telegram
-def tg(cfg, method, **params):
+def tg(cfg, method, _timeout=70, **params):
     if not cfg.get("token"):
         raise RuntimeError("Telegram is not set up (no token in config.json)")
     data = urllib.parse.urlencode(params).encode()
     url = "https://api.telegram.org/bot%s/%s" % (cfg["token"], method)
-    with urllib.request.urlopen(url, data=data, timeout=70) as r:
+    with urllib.request.urlopen(url, data=data, timeout=_timeout) as r:
         res = json.load(r)
     if not res.get("ok"):
         raise RuntimeError("telegram %s: %s" % (method, res.get("description")))
     return res
+
+
+def http_error_text(e):
+    """Telegram's own reason in an HTTP error ("Bad Request: message thread not found"...)"""
+    try:
+        return json.loads(e.read().decode("utf-8", "replace")).get("description") or str(e)
+    except Exception:
+        return str(e)
 
 
 def mark_sent():
@@ -97,14 +112,192 @@ def mark_sent():
         pass
 
 
-def send(cfg, text):
+# config keys the owner flips from Telegram (/stream, /topics) -> value when the key is missing
+TOGGLES = {"stream": False, "topics": True}            # stream is opt-in: 11-04 a phone app hung around a draft
+ON_WORDS, OFF_WORDS = ("開", "開啟", "on"), ("關", "關閉", "off")
+
+
+def toggle_on(cfg, name):
+    v = cfg.get(name)
+    return TOGGLES[name] if v is None else bool(v)
+
+
+def set_toggle(cfg, name, arg=""):
+    """flip a TOGGLES key in config.json (or set it: 開/關/on/off); cfg gets the new value too -> new value"""
+    disk = load_cfg()
+    arg = (arg or "").strip().lower()
+    on = True if arg in ON_WORDS else False if arg in OFF_WORDS else not toggle_on(disk, name)
+    disk[name] = cfg[name] = on
+    save_json(CFG, disk)
+    return on
+
+
+# ---------------------------------------------------------------- Telegram topics (private chats, Bot API 9.3+)
+# Topic mode is the owner's choice in @BotFather; nothing here creates topics. The bridge keeps the topic of the
+# owner's latest message in THREAD, and every reply (also from the separate `tgterm.py send` process) goes there.
+def thread_of(m):
+    t = m.get("message_thread_id")
+    return t if type(t) is int and t > 0 else None
+
+
+def thread_locked():
+    """one process at a time on THREAD: the bridge rewrites it while `send` processes read it (on Windows a file open
+    for reading cannot be replaced), and forgetting a refused topic must never delete a newer one"""
+    return named_lock("Local\\agent-tg-thread", 5000)
+
+
+def _saved_thread():
+    data = load_json(THREAD, None)
+    return thread_of(data) if isinstance(data, dict) else None
+
+
+def saved_thread():
+    with thread_locked():
+        return _saved_thread()
+
+
+def remember_thread(m):
+    """the topic of the owner's message, or none (written only when it changes)"""
+    thread = thread_of(m)
+    with thread_locked():
+        if thread == _saved_thread():
+            return
+        try:
+            if thread:
+                save_json(THREAD, {"message_thread_id": thread, "since": time.strftime("%Y-%m-%d %H:%M:%S")})
+            else:
+                os.remove(THREAD)
+        except OSError as e:
+            log("topic not saved: %r" % e)
+
+
+def forget_thread(thread):
+    with thread_locked():
+        if _saved_thread() == thread:                   # a newer topic the bridge just wrote stays
+            try:
+                os.remove(THREAD)
+            except OSError:
+                pass
+
+
+def reply_thread(cfg):
+    """the topic replies go to; None = no topic (topics off, or the owner's last message was not in a topic)"""
+    return saved_thread() if toggle_on(cfg, "topics") else None
+
+
+def in_thread(thread, fn, *args, **params):
+    """fn(..., message_thread_id=thread) when there is a topic. A topic Telegram refuses (deleted, or topic mode turned
+    off in @BotFather) must not lose the reply: it goes out without the topic and the topic is forgotten.
+    -> (fn's result, the topic actually used)"""
+    if thread:
+        try:
+            return fn(*args, message_thread_id=thread, **params), thread
+        except urllib.error.HTTPError as e:
+            if e.code != 400:
+                raise
+            why = http_error_text(e)
+        res = fn(*args, **params)
+        forget_thread(thread)
+        log("topic %s refused (%s): sent without it" % (thread, why))
+        return res, None
+    return fn(*args, **params), None
+
+
+def bot_topics(cfg):
+    """topic mode for this bot in @BotFather (getMe has_topics_enabled); None when Telegram cannot be asked"""
+    try:
+        return bool(tg(cfg, "getMe", _timeout=15)["result"].get("has_topics_enabled"))
+    except Exception as e:
+        log("getMe: %r" % e)
+        return None
+
+
+# ---------------------------------------------------------------- streamed replies (sendMessageDraft, Bot API 9.3+)
+# times in seconds: "Thinking…" alone, the whole animation, least time left worth one more draft, hard cap
+DRAFT_STEPS, DRAFT_THINK, DRAFT_SECONDS, DRAFT_MIN_CALL, DRAFT_LIMIT = 20, 0.4, 2.5, 0.5, 4.0
+
+
+def utf16_len(text):
+    return len(text.encode("utf-16-le")) // 2           # Telegram counts text length in UTF-16 units
+
+
+def draft_cuts(n, steps=DRAFT_STEPS):
+    """prefix lengths the draft grows through: at most `steps`, about even, the last one the whole text"""
+    if n <= 0:
+        return []
+    size = -(-n // max(1, min(steps, n // 3)))
+    return list(range(size, n, size)) + [n]
+
+
+def cuts_due(elapsed, count, seconds=DRAFT_SECONDS, think=DRAFT_THINK):
+    """how many cuts should be on screen `elapsed` s after "Thinking…": the first at `think`, the last at `seconds`"""
+    if count <= 0 or elapsed < think:
+        return 0
+    if count == 1 or elapsed >= seconds:
+        return count
+    return min(count, 1 + int((elapsed - think) * (count - 1) / (seconds - think) + 1e-9))
+
+
+def cut_time(k, count, seconds=DRAFT_SECONDS, think=DRAFT_THINK):
+    """when cut k (1-based) is due, in seconds after "Thinking…" """
+    return think if count <= 1 else think + (seconds - think) * (k - 1) / (count - 1)
+
+
+def draft_poster(cfg, thread):
+    """post(text, timeout): one sendMessageDraft for this reply, in the same chat and topic as the message after it"""
+    did = int(time.time() * 1000) % 2000000000 or 1         # non-zero; one id per reply, so its updates animate
+    where = {"message_thread_id": thread} if thread else {}
+
+    def post(part, timeout):
+        tg(cfg, "sendMessageDraft", _timeout=timeout, chat_id=cfg["owner_id"], draft_id=did, text=part, **where)
+        if not part:
+            mark_sent()                                 # "Thinking…" takes over from "typing…"
+    return post
+
+
+def stream_draft(cfg, text, thread=None, post=None, scale=1.0):
+    """show the reply growing in a draft bubble before the real message: "Thinking…", then longer and longer prefixes
+    for about DRAFT_SECONDS. Drafts are an ephemeral preview: send() still sends the message itself, right after.
+    A slow network skips steps instead of stretching the animation, nothing here holds the message back longer than
+    DRAFT_LIMIT, and any failure just ends the preview quietly. post / scale are for the selftest.
+    -> number of drafts shown"""
+    cuts = draft_cuts(len(text))
+    if not cuts or utf16_len(text) > 4096:
+        return 0
+    think, seconds, min_call, limit = (x * scale for x in (DRAFT_THINK, DRAFT_SECONDS, DRAFT_MIN_CALL, DRAFT_LIMIT))
+    post = post or draft_poster(cfg, thread)
+    start, shown, calls = time.monotonic(), 0, 0
+    try:
+        post("", limit)                                 # empty text = the "Thinking…" placeholder
+        calls = 1
+        while shown < len(cuts):
+            elapsed = time.monotonic() - start
+            if limit - elapsed < min_call:              # the network is too slow today: send the message now
+                break
+            due = cuts_due(elapsed, len(cuts), seconds, think)
+            if due <= shown:                            # early: wait for the next cut (its time counts from start)
+                wake = min(cut_time(shown + 1, len(cuts), seconds, think), limit - min_call)
+                time.sleep(max(0.001, wake - elapsed))
+                continue
+            post(text[:cuts[due - 1]], limit - elapsed)  # late cuts are skipped, the animation keeps its length
+            shown, calls = due, calls + 1
+    except Exception as e:
+        why = http_error_text(e) if isinstance(e, urllib.error.HTTPError) else repr(e)
+        log("draft stopped after %d: %s" % (calls, why))
+    return calls
+
+
+def send(cfg, text, stream=False):
     text = (text or "").strip() or "（空白）"
     if not cfg.get("owner_id"):
         raise RuntimeError("owner_id missing in config.json")
+    thread = reply_thread(cfg)
+    drafts = stream_draft(cfg, text, thread) if stream else 0
     for i in range(0, len(text), 3900):
-        tg(cfg, "sendMessage", chat_id=cfg["owner_id"], text=text[i:i + 3900])
+        _, thread = in_thread(thread, tg, cfg, "sendMessage", chat_id=cfg["owner_id"], text=text[i:i + 3900])
     mark_sent()
-    log("sent %d chars" % len(text))
+    log("sent %d chars%s%s" % (len(text), " in topic %s" % thread if thread else "",
+                               " after %d drafts" % drafts if drafts else ""))
 
 
 # Telegram Bot API upload limits: photos 10 MB, everything else 50 MB
@@ -121,13 +314,23 @@ def send_media(cfg, kind, path, caption=""):
             kind, method = "document", "sendDocument"           # too big for a photo: send it as a file
         else:
             raise RuntimeError("file is %.1f MB; Telegram bots can send at most %d MB" % (size / 1048576, limit_mb))
-    boundary = "----agentsetup" + uuid.uuid4().hex
     with open(path, "rb") as f:
         data = f.read()
-    body = b""
-    for name, value in (("chat_id", str(cfg["owner_id"])), ("caption", caption[:1000])):
-        body += ('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s\r\n' % (boundary, name, value)).encode("utf-8")
     filename = os.path.basename(path).replace('"', "_")
+    _, thread = in_thread(reply_thread(cfg), upload, cfg, method, kind, filename, data, caption)
+    mark_sent()
+    log("sent %s %s (%d bytes)%s" % (kind, filename, size, " in topic %s" % thread if thread else ""))
+
+
+def upload(cfg, method, kind, filename, data, caption, message_thread_id=None):
+    """one multipart sendPhoto / sendDocument / sendVideo"""
+    boundary = "----agentsetup" + uuid.uuid4().hex
+    fields = [("chat_id", str(cfg["owner_id"])), ("caption", caption[:1000])]
+    if message_thread_id:
+        fields.append(("message_thread_id", str(message_thread_id)))
+    body = b""
+    for name, value in fields:
+        body += ('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s\r\n' % (boundary, name, value)).encode("utf-8")
     body += ('--%s\r\nContent-Disposition: form-data; name="%s"; filename="%s"\r\n'
              'Content-Type: application/octet-stream\r\n\r\n' % (boundary, kind, filename)).encode("utf-8") + data + b"\r\n"
     body += ("--%s--\r\n" % boundary).encode("utf-8")
@@ -137,8 +340,7 @@ def send_media(cfg, kind, path, caption=""):
         res = json.load(r)
     if not res.get("ok"):
         raise RuntimeError("telegram %s: %s" % (method, res.get("description")))
-    mark_sent()
-    log("sent %s %s (%d bytes)" % (kind, filename, size))
+    return res
 
 
 def send_photo(cfg, path, caption):
@@ -618,11 +820,15 @@ INCOMING = (
 COMMANDS = [("status", "AI 狀態"), ("stop", "中斷 AI 正在做的事"), ("restart", "重開 AI 視窗"),
             ("new", "重開並開始新對話"), ("screen", "傳目前的電腦畫面"),
             ("allow", "放行安全防護剛擋下的動作一次"), ("update", "更新輔助程式（/update 還原＝退回上一版）"),
+            ("stream", "回覆逐字顯示 開／關（預設關）"), ("topics", "回在你傳訊息的主題 開／關"),
             ("help", "指令說明")]
 HIDDEN_COMMANDS = ("rollback",)                         # not in the Telegram menu: /還原 or /update 還原
 ALIASES = {"狀態": "status", "停": "stop", "停止": "stop", "重開": "restart", "新對話": "new",
            "畫面": "screen", "截圖": "screen", "允許": "allow", "放行": "allow", "說明": "help",
-           "更新": "update", "還原": "rollback"}
+           "更新": "update", "還原": "rollback", "串流": "stream", "主題": "topics"}
+# the owner made, renamed, closed... a topic: nothing for the AI, nothing to answer
+TOPIC_EVENTS = ("forum_topic_created", "forum_topic_edited", "forum_topic_closed", "forum_topic_reopened",
+                "general_forum_topic_hidden", "general_forum_topic_unhidden")
 ROLLBACK_WORDS = ("還原", "退回", "rollback", "undo")
 CHECK_WORDS = ("檢查", "check")
 ALLOW = os.path.join(BASE, "allow-once")                # read and removed by guard.py
@@ -651,7 +857,7 @@ def typing_loop():
                 _awaiting["since"] = 0.0
                 continue
             cfg = load_cfg()
-            tg(cfg, "sendChatAction", chat_id=cfg["owner_id"], action="typing")
+            in_thread(reply_thread(cfg), tg, cfg, "sendChatAction", chat_id=cfg["owner_id"], action="typing")
         except Exception as e:
             log("typing: %r" % e)
 
@@ -725,9 +931,11 @@ def command(cfg, name, arg=""):
         pid = agent_pid()
         sent = time.strftime("%m/%d %H:%M", time.localtime(os.path.getmtime(LAST_SENT))) if os.path.exists(LAST_SENT) else "還沒有"
         busy = "（還在處理你上一則訊息）" if _awaiting["since"] else ""
-        send(cfg, "AI 視窗：%s%s\n最後一次回覆：%s\n自動重開：%s\n版本：%s" % (
+        send(cfg, "AI 視窗：%s%s\n最後一次回覆：%s\n自動重開：%s\n%s\n版本：%s" % (
             "運作中" if pid else "沒有開著（1 分鐘內會自動重開）", busy, sent,
-            "暫停中" if os.path.exists(PAUSED) else "開啟", short_version(installed_version())))
+            "暫停中" if os.path.exists(PAUSED) else "開啟", toggles_text(cfg), short_version(installed_version())))
+    elif name in TOGGLES:
+        send(cfg, toggle_reply(cfg, name, set_toggle(cfg, name, arg)))
     elif name in ("update", "rollback"):
         if name == "rollback" or arg in ROLLBACK_WORDS:
             spawn_update("--rollback")
@@ -758,16 +966,45 @@ def command(cfg, name, arg=""):
         deliver(cfg, "主人打了 /allow：同意放行剛才被安全防護擋下的那個動作（只放行一次，10 分鐘內有效）。"
                      "請現在重試那個動作，做完回報結果。")
     else:
-        send(cfg, "直接傳訊息就是跟 AI 說話；圖片、檔案、影片、語音都可以傳。\n" +
-             "\n".join("/%s  %s" % c for c in COMMANDS) +
-             "\n/update 檢查  只看有沒有新版" +
-             "\n（也可以打中文：/狀態 /停 /重開 /新對話 /畫面 /允許 /更新 /還原）")
+        send(cfg, help_text())
+
+
+def help_text():
+    return ("直接傳訊息就是跟 AI 說話；圖片、檔案、影片、語音都可以傳。\n" +
+            "\n".join("/%s  %s" % c for c in COMMANDS) +
+            "\n/update 檢查  只看有沒有新版" +
+            "\n/stream 開｜關、/topics 開｜關  直接指定（不加就是切換）" +
+            "\n（也可以打中文：/狀態 /停 /重開 /新對話 /畫面 /允許 /更新 /還原 /串流 /主題）")
+
+
+def toggles_text(cfg):
+    bot = {True: "（機器人已開主題模式）", False: "（機器人沒開主題模式，回覆都在同一個聊天室）", None: ""}
+    return "逐字顯示：%s\n跟著主題回覆：%s%s" % ("開" if toggle_on(cfg, "stream") else "關",
+                                         "開" if toggle_on(cfg, "topics") else "關",
+                                         bot[bot_topics(cfg)] if toggle_on(cfg, "topics") else "")
+
+
+def toggle_reply(cfg, name, on):
+    if name == "stream":
+        if on:
+            return ("逐字顯示：已開啟。AI 的回覆會先出現「Thinking…」，再一段段長出來（約 2.5 秒），最後變成正式訊息。\n"
+                    "如果 Telegram 因此卡住或怪怪的，打 /串流 關 就恢復原狀。")
+        return "逐字顯示：已關閉，AI 的回覆會整則直接送出。要再開：/串流 開"
+    if not on:
+        return "跟著主題回覆：已關閉，AI 的回覆不分主題，一律送到同一個聊天室。要再開：/主題 開"
+    bot = bot_topics(cfg)
+    return "跟著主題回覆：已開啟，你在哪個主題傳訊息，AI 就回在哪個主題。" + (
+        "\n（你的機器人還沒開主題模式，所以目前只有一個聊天室；想分主題，先到 @BotFather 幫機器人開啟主題模式）"
+        if bot is False else "")
 
 
 def handle(cfg, m):
     chat, frm = m.get("chat") or {}, m.get("from") or {}
     if chat.get("type") != "private" or frm.get("id") != cfg.get("owner_id"):
         log("ignored message from %s" % frm.get("id"))
+        return
+    remember_thread(m)                                  # replies (also the AI's `send`) go to this message's topic
+    if any(k in m for k in TOPIC_EVENTS):
         return
     text = (m.get("text") or m.get("caption") or "").strip()
     if text.startswith("/"):
@@ -928,18 +1165,27 @@ def handoff_guard():
 
 
 # ---------------------------------------------------------------- reminders (fired by the watchdog, minute precision)
-class reminders_locked:
-    """cross-process lock around reminders.json (the AI's remind add vs. the watchdog firing)"""
+class named_lock:
+    """cross-process lock (a named mutex); after `wait` ms the caller goes on anyway"""
+    def __init__(self, name, wait=30000):
+        self.name, self.wait = name, wait
+
     def __enter__(self):
-        self.h = k32.CreateMutexW(None, False, "Local\\agent-reminders")
-        if self.h:
-            k32.WaitForSingleObject(self.h, 30000)
+        self.h = k32.CreateMutexW(None, False, self.name)
+        self.owned = bool(self.h) and k32.WaitForSingleObject(self.h, self.wait) in (0, 0x80)   # signaled / abandoned
         return self
 
     def __exit__(self, *exc):
         if self.h:
-            k32.ReleaseMutex(self.h)
+            if self.owned:
+                k32.ReleaseMutex(self.h)
             k32.CloseHandle(self.h)
+
+
+class reminders_locked(named_lock):
+    """cross-process lock around reminders.json (the AI's remind add vs. the watchdog firing)"""
+    def __init__(self):
+        super().__init__("Local\\agent-reminders")
 
 
 def next_fire(item, after):
@@ -2120,7 +2366,145 @@ def selftest():
     finally:
         shutil.rmtree(BACKUPS)
         BACKUPS = saved
+    selftest_telegram()
     print("selftest ok")
+
+
+def selftest_telegram():
+    """streamed replies and topics: pure logic plus temp files; Telegram is never called (configs have no token)"""
+    import tempfile
+    global THREAD, CFG, LOG
+    saved, d = (THREAD, CFG, LOG), tempfile.mkdtemp()
+    THREAD, CFG, LOG = (os.path.join(d, name) for name in ("tg-thread.json", "config.json", "tgterm.log"))
+    try:
+        selftest_drafts()
+        selftest_topics()
+    finally:
+        shutil.rmtree(d)
+        THREAD, CFG, LOG = saved
+    names = dict(COMMANDS)
+    assert all(v in names or v in HIDDEN_COMMANDS for v in ALIASES.values()) and set(TOGGLES) <= set(names)
+    assert ALIASES["串流"] == "stream" and ALIASES["主題"] == "topics"
+    assert all("/" + c in help_text() for c in names) and "/串流" in help_text() and "/主題" in help_text()
+    assert all(re.fullmatch(r"[a-z0-9_]{1,32}", c) and 0 < len(t) <= 256 for c, t in COMMANDS)   # setMyCommands rules
+
+
+def selftest_drafts():
+    """streamed replies: the cut / step math, then the timing against a fake network"""
+    for n in (1, 2, 3, 10, 59, 60, 61, 100, 101, 3900, 4096):
+        cuts = draft_cuts(n)
+        assert cuts[-1] == n and 1 <= len(cuts) <= DRAFT_STEPS and cuts == sorted(set(cuts)), (n, cuts)
+    assert draft_cuts(0) == [] and draft_cuts(1) == [1] and draft_cuts(10) == [4, 8, 10] and len(draft_cuts(100)) == 20
+    for count in (1, 2, 7, 20):
+        assert cuts_due(0, count) == 0 and cuts_due(DRAFT_SECONDS, count) == count == cuts_due(99, count)
+        for k in range(1, count + 1):
+            t = cut_time(k, count)
+            assert cuts_due(t, count) >= k > cuts_due(t - 0.01, count), (count, k, t)   # due on time, not before
+    assert cut_time(1, 20) == DRAFT_THINK and abs(cut_time(20, 20) - DRAFT_SECONDS) < 1e-9
+    assert utf16_len("a😀") == 3 and DRAFT_LIMIT <= 4.0
+
+    scale = 0.1                                         # the whole timing at a tenth: 2.5 s -> 0.25 s
+
+    def run(text, delay=0.0, fail_at=None):
+        """stream with a fake network: each call takes `delay` (real-time) s, or times out past its timeout"""
+        posted = []
+
+        def post(part, timeout):
+            posted.append(part)
+            if fail_at == len(posted) or delay * scale > timeout:
+                time.sleep(min(delay * scale, timeout))
+                raise OSError("timed out" if delay * scale > timeout else "draft refused")
+            time.sleep(delay * scale)
+        t0 = time.monotonic()
+        n = stream_draft({}, text, post=post, scale=scale)
+        return n, posted, (time.monotonic() - t0) / scale
+    full = "一二三四五六七八九十" * 10
+    n, posted, took = run(full)                         # fast network: "Thinking…", then 20 growing prefixes in ~2.5 s
+    assert posted[0] == "" and posted[-1] == full and n == len(posted) <= DRAFT_STEPS + 1, (n, posted)
+    assert all(full.startswith(p) and len(p) > len(q) for p, q in zip(posted[1:], posted)), posted
+    assert DRAFT_SECONDS - 0.3 <= took < DRAFT_LIMIT, took
+    for delay in (0.75, 1.5, 2.25, 4.5):                # slow networks: fewer steps, never past the cap
+        n, posted, took = run(full, delay)
+        assert took <= DRAFT_LIMIT + 0.4 and n <= len(posted), (delay, took, n)
+        assert delay > 1.5 or posted[-1] == full, (delay, posted)
+    n, posted, took = run(full, fail_at=3)              # a refused draft ends the preview quietly
+    assert n == 2 and len(posted) == 3 and took < DRAFT_LIMIT, (n, posted, took)
+    assert run("x" * 4097)[1] == [] and run("😀" * 2049)[1] == [] and run("")[1] == []   # over 4096: no preview
+    assert run("😀" * 2048)[1][-1] == "😀" * 2048
+
+
+def selftest_topics():
+    """topics: the remembered topic across processes, refused topics, the toggles, topic events (temp files only)"""
+    import io
+    assert saved_thread() is None and reply_thread({}) is None
+    remember_thread({"message_thread_id": 7, "text": "hi"})
+    # `tgterm.py send` is another process: it only has the file
+    assert load_json(THREAD, None)["message_thread_id"] == 7 and saved_thread() == 7
+    assert reply_thread({}) == 7 and reply_thread({"topics": True}) == 7 and reply_thread({"topics": False}) is None
+    forget_thread(8)
+    assert saved_thread() == 7                          # forgetting another topic leaves this one
+    for m in ({"text": "not in a topic"}, {"message_thread_id": True}, {"message_thread_id": "7"},
+              {"message_thread_id": 0}):
+        remember_thread({"message_thread_id": 7})
+        remember_thread(m)
+        assert saved_thread() is None and not os.path.exists(THREAD), m
+    save_json(THREAD, ["broken"])
+    assert saved_thread() is None
+    # a `send` forgetting refused topic 5 waits for the lock, then finds the bridge's newer topic 6 and leaves it
+    remember_thread({"message_thread_id": 5})
+    done = []
+    with thread_locked():
+        w = threading.Thread(target=lambda: done.append(forget_thread(5)))
+        w.start()
+        time.sleep(0.2)
+        assert not done                                 # blocked behind the lock
+        save_json(THREAD, {"message_thread_id": 6})
+    w.join(5)
+    assert done and saved_thread() == 6
+
+    calls = []
+
+    def fake(code=400, always=False):
+        def fn(**kw):
+            calls.append(kw)
+            if always or "message_thread_id" in kw:
+                raise urllib.error.HTTPError("https://api.telegram.org/x", code, "err", None, io.BytesIO(
+                    b'{"ok":false,"description":"Bad Request: message thread not found"}'))
+            return "ok"
+        return fn
+    remember_thread({"message_thread_id": 5})
+    assert in_thread(5, fake(), text="x") == ("ok", None)           # a refused topic: sent without it, forgotten
+    assert calls == [{"text": "x", "message_thread_id": 5}, {"text": "x"}] and saved_thread() is None, calls
+    assert "message thread not found" in load_text(LOG)
+    del calls[:]
+    assert in_thread(None, fake(), text="y") == ("ok", None) and calls == [{"text": "y"}]
+    try:
+        in_thread(5, fake(429), text="z")               # anything but a refused topic is not retried
+        raise AssertionError("429 retried")
+    except urllib.error.HTTPError as e:
+        assert e.code == 429 and len(calls) == 2
+    remember_thread({"message_thread_id": 5})
+    try:
+        in_thread(5, fake(always=True), text="too long")   # refused with and without the topic: not the topic's fault
+        raise AssertionError("error swallowed")
+    except urllib.error.HTTPError:
+        assert len(calls) == 4 and saved_thread() == 5  # the error reaches the caller and the topic is kept
+
+    save_json(CFG, {"token": "", "owner_id": 1, "agent_name": "名字"})
+    cfg = load_cfg()
+    assert not toggle_on(cfg, "stream") and toggle_on(cfg, "topics")                  # defaults: stream off, topics on
+    assert set_toggle(cfg, "stream") is True and cfg["stream"] is True and load_cfg()["stream"] is True
+    assert set_toggle(cfg, "stream", "開") is True and set_toggle(cfg, "stream", " OFF ") is False
+    assert set_toggle(cfg, "topics") is False and load_cfg()["topics"] is False
+    assert set_toggle(cfg, "topics", "on") is True and load_cfg()["agent_name"] == "名字"
+    assert toggle_on({"stream": 0}, "stream") is False and toggle_on({"topics": None}, "topics") is True
+
+    # the owner making a topic: remembered, not answered (with no token any reply would raise)
+    handle(cfg, {"chat": {"type": "private"}, "from": {"id": 1}, "message_thread_id": 12,
+                 "forum_topic_created": {"name": "工作", "icon_color": 7322096}})
+    assert saved_thread() == 12
+    handle(cfg, {"chat": {"type": "private"}, "from": {"id": 2}, "message_thread_id": 13, "text": "x"})
+    assert saved_thread() == 12                         # someone else's message never moves the topic
 
 
 def main(argv):
@@ -2140,7 +2524,7 @@ def main(argv):
                 text = sys.stdin.buffer.read().decode("utf-8", errors="replace")
             else:
                 text = " ".join(args)
-            send(cfg, text)
+            send(cfg, text, stream=toggle_on(cfg, "stream"))   # the AI's replies; the bridge's own notes never stream
         print("sent")
     elif cmd == "remind":
         sub, args = (argv[2] if len(argv) > 2 else "list"), argv[3:]
