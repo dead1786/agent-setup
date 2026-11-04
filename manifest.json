@@ -1,7 +1,7 @@
 {
-  "version": "ef925316685d3c9c702aceef039a0741b4137f94",
+  "version": "467f411cf2fe2a292de39c611867205dd3710fa9",
   "files": {
-    "tgterm.py": "402624a559961787cebb666fcc71c9abc14127dc18d23ebd574c7d41dcd9f71a",
+    "tgterm.py": "408d8e1cac16ff93814cc0f0104dceecd6e308728516cb2dc3b9253ae9fb2dbb",
     "winsend.py": "0089b099a5196819cb891a6339dc03508f23204743adaff4517979e8295e5fa1",
     "skills/winsend/SKILL.md": "1f52e2fc29145ab7fa1ca4ac1a39eac9910b5b49306cce2716e452ffd7ada891",
     "skills/memory-rag/SKILL.md": "21a521973b965eb624b0a1853e01299aefadbc1a2d793ca3bd3ac8cd6fb0de55",
@@ -20,6 +20,7 @@
   },
   "known": {
     "tgterm.py": [
+      "408d8e1cac16ff93814cc0f0104dceecd6e308728516cb2dc3b9253ae9fb2dbb",
       "402624a559961787cebb666fcc71c9abc14127dc18d23ebd574c7d41dcd9f71a",
       "f5b7e53ebb36a25df128e1d38dcdae8a75e8bebfa372759281114ce9f437d6b8",
       "1bf9650c5850819f1387fdda69f916d3d52089f081c930df9d5dd826bb42a73a",
@@ -91,8 +92,7 @@
     "pillow"
   ],
   "notes": [
-    "安全防護不再誤擋 AI 傳 Telegram（同一串指令裡有寫檔時，例如長訊息先存暫存檔再傳）",
-    "安裝檢查：送字測試前先等你確認 AI 已登入、看到輸入框；沒回應會自動再送一次；失敗時印出防護與 Telegram 紀錄",
-    "找不到 Windows Terminal 時改從系統別名路徑開；真的只能用一般視窗時，標題被 AI 改掉只算提醒（WARN），不算失敗"
+    "新功能：主題串（預設開）——在 @BotFather 幫你的 bot 開了「主題」後，AI 會回到你傳訊息的那個主題；沒開就跟以前一樣。/主題 可以開關",
+    "新功能：逐字顯示（預設關）——AI 回覆時一個字一個字冒出來；有些手機會卡住輸入，所以預設關，想試打 /串流 開"
   ]
 }
