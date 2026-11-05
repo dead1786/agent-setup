@@ -1,7 +1,7 @@
 {
-  "version": "82768779fad91169ade559de4b82757e8fd8f231",
+  "version": "fccebb5fdb18b2ab522ac189d2bf477f18bca0aa",
   "files": {
-    "tgterm.py": "468ca5675796be68f32946b19bf0a08f4db74daebe8342374000fdd803ba7af5",
+    "tgterm.py": "5112d75ef7a0c39f70c903aa609c9895ec34f30eba4909846a901cc94f1c6557",
     "winsend.py": "0089b099a5196819cb891a6339dc03508f23204743adaff4517979e8295e5fa1",
     "skills/winsend/SKILL.md": "1f52e2fc29145ab7fa1ca4ac1a39eac9910b5b49306cce2716e452ffd7ada891",
     "skills/memory-rag/SKILL.md": "21a521973b965eb624b0a1853e01299aefadbc1a2d793ca3bd3ac8cd6fb0de55",
@@ -20,6 +20,7 @@
   },
   "known": {
     "tgterm.py": [
+      "5112d75ef7a0c39f70c903aa609c9895ec34f30eba4909846a901cc94f1c6557",
       "468ca5675796be68f32946b19bf0a08f4db74daebe8342374000fdd803ba7af5",
       "408d8e1cac16ff93814cc0f0104dceecd6e308728516cb2dc3b9253ae9fb2dbb",
       "402624a559961787cebb666fcc71c9abc14127dc18d23ebd574c7d41dcd9f71a",
@@ -93,6 +94,7 @@
     "pillow"
   ],
   "notes": [
-    "修正：電腦重開機後 AI 視窗有時不會自己開回來，現在登入 Windows 後就會自動開（更新後第一次執行會自動補上，不用另外設定）"
+    "修正：電腦重開機後 AI 視窗有時不會自己開回來，現在登入 Windows 後就會自動開（更新後第一次執行會自動補上）",
+    "更新防呆：有檔案被你或 AI 改過、這次沒換成新版時，報告第一行會先警告，AI 也會主動跟你說明兩版差在哪裡、問你要怎麼處理；/status 會註明哪個檔沒更新"
   ]
 }
