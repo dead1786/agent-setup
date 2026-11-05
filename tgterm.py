@@ -45,6 +45,7 @@ REMINDERS = os.path.join(BASE, "reminders.json")
 THREAD = os.path.join(BASE, "tg-thread.json")          # the topic of the owner's latest message (private-chat topics)
 TASK = "agent-watchdog"                                # the scheduled task bootstrap.ps1 registers
 LOGON_MARK = os.path.join(BASE, "logon-trigger")       # "ok …" once the task has its "at sign-in" trigger
+KEPT_DIFF = os.path.join(BASE, "update-kept.md")       # the last update's skipped files: what differs, for the AI
 MUTEX = "Local\\agent-tgterm-bridge"
 # Claude Code's manual sign-in redirect (MANUAL_REDIRECT_URL in its source): the page shows a code to paste back
 MANUAL_REDIRECT = "https://platform.claude.com/oauth/code/callback"
@@ -935,7 +936,7 @@ def command(cfg, name, arg=""):
         busy = "（還在處理你上一則訊息）" if _awaiting["since"] else ""
         send(cfg, "AI 視窗：%s%s\n最後一次回覆：%s\n自動重開：%s\n%s\n版本：%s" % (
             "運作中" if pid else "沒有開著（1 分鐘內會自動重開）", busy, sent,
-            "暫停中" if os.path.exists(PAUSED) else "開啟", toggles_text(cfg), short_version(installed_version())))
+            "暫停中" if os.path.exists(PAUSED) else "開啟", toggles_text(cfg), version_text()))
     elif name in TOGGLES:
         send(cfg, toggle_reply(cfg, name, set_toggle(cfg, name, arg)))
     elif name in ("update", "rollback"):
@@ -1733,6 +1734,17 @@ def short_version(v):
     return v[:7] if v else "舊版（沒有版本紀錄）"
 
 
+def kept_hint(installed):
+    """the last update left these files alone (changed here): its fixes in them are not running"""
+    kept = installed.get("kept_files") if isinstance(installed, dict) else None
+    return "（%s 被改過、沒更新，新版在旁邊的 .new 檔）" % "、".join(kept) if kept else ""
+
+
+def version_text():
+    data = load_json(INSTALLED, None)
+    return short_version(installed_version()) + kept_hint(data)
+
+
 def home_dir():
     return os.environ.get("AGENT_SETUP_HOME") or os.path.expanduser("~")
 
@@ -2056,6 +2068,40 @@ def tell_ai(text):
         return False
 
 
+def write_kept_diff(frm, m, kept):
+    """files the update left alone (changed here): current vs new as a diff the AI can read without running any
+    command (the guard blocks commands that touch the helper files). None, and no stale file, when nothing was kept"""
+    import difflib
+    if not kept:
+        if os.path.exists(KEPT_DIFF):
+            os.remove(KEPT_DIFF)
+        return None
+    out = ["# 更新沒有覆蓋的檔案（%s → %s）" % (short_version(frm), short_version(m["version"])), "",
+           "這些檔案被改過，更新程式沒有換掉；新版放在同一個資料夾的「檔名.new」。",
+           "差異裡 - 開頭＝目前在用的（含這台改過的地方），+ 開頭＝新版（含這次更新的修正）。", ""]
+    if m.get("notes"):
+        out += ["## 這次更新的內容"] + ["- " + str(n) for n in m["notes"][:5]] + [""]
+    for rel, dest in kept:
+        diff = list(difflib.unified_diff(load_text(dest).splitlines(), load_text(dest + ".new").splitlines(),
+                                         "目前的 " + rel, "新版 " + rel, n=2, lineterm=""))
+        more = ["…（差異太長，只列前 400 行；完整新版在 %s.new）" % dest] if len(diff) > 400 else []
+        out += ["## " + file_label(rel, dest) + "（" + dest + "）", "```diff"] + (diff[:400] or ["（內容一樣）"]) + more + ["```", ""]
+    write_text(KEPT_DIFF, "\n".join(out) + "\n")
+    return KEPT_DIFF
+
+
+def kept_note(kept, side, m, cfg):
+    who = rules_vars(cfg, load_json(ANSWERS, None)).get("user") or "主人"
+    how = "（用 Telegram 問）" if cfg.get("token") else ""
+    names = "、".join(file_label(rel, dest) for rel, dest in kept)
+    where = ("差異已經整理在 %s，直接讀這個檔就好，不用自己下指令比對。" % side) if side else "新版放在同名的 .new 檔。"
+    return ("輔助程式剛更新到 %s，但 %s 被改過，更新程式沒有覆蓋（新版放在旁邊的 .new 檔），所以這次更新的修正可能還沒生效。%s"
+            "請讀完後用白話跟%s說明%s：①目前的版本改了什麼 ②新版改了什麼 ③建議怎麼做（合併兩邊／改用新版、放棄這裡的改動／先維持現狀），"
+            "等%s決定再動手；改輔助程式會被安全防護擋，要%s同意並放行%s。%s沒有同意前不要動這些檔案。"
+            % (short_version(m["version"]), names, where, who, how, who, who,
+               "（在 Telegram 打 /allow）" if cfg.get("token") else "", who))
+
+
 def rules_note(plan, cfg):
     who = rules_vars(cfg, load_json(ANSWERS, None)).get("user") or "主人"
     how = "（用 Telegram 問）" if cfg.get("token") else ""
@@ -2111,12 +2157,18 @@ def rollback_hint():
 def update_report(frm, m, plan, rules, extra, told, cfg):
     def files(act):
         return [file_label(rel, dest) for rel, dest, a in plan if a == act]
-    lines = ["✅ 更新完成：%s → %s" % (short_version(frm), short_version(m["version"]))]
+    kept = files("keep")
+    if kept:                                            # partly updated: say so first, not in the middle
+        lines = ["⚠️ 更新只完成一部分：%s → %s" % (short_version(frm), short_version(m["version"])),
+                 "⚠️ %s 被你或 AI 改過，沒有換成新版（新版放在旁邊的 .new 檔），這次的修正可能還沒生效。%s"
+                 % ("、".join(kept), "已請 AI 讀差異後跟你說明、問你要怎麼處理" if told else
+                    "可以請 AI 讀 %s 後跟你說明怎麼處理" % KEPT_DIFF if os.path.exists(KEPT_DIFF) else
+                    "可以請 AI 比對旁邊的 .new 檔後跟你說明怎麼處理")]
+    else:
+        lines = ["✅ 更新完成：%s → %s" % (short_version(frm), short_version(m["version"]))]
     for act, title in (("replace", "更新"), ("add", "新增")):
         if files(act):
             lines.append("%s %d 個：%s" % (title, len(files(act)), "、".join(files(act))))
-    if files("keep"):
-        lines.append("你或 AI 改過、沒動（新版存在旁邊的 .new 檔）：" + "、".join(files("keep")))
     if not any(a != "same" for _, _, a in plan):
         lines.append("檔案：都已經是新版")
     lines += rules_lines(rules, told, cfg) + [x for x in extra if x]
@@ -2179,7 +2231,7 @@ def update_run(cfg, o):
             return code
     frm = installed.get("version")
     if frm == m["version"] and not o["force"]:
-        return update_say(cfg, o, "已經是最新版（%s），不用更新。" % short_version(frm))
+        return update_say(cfg, o, "已經是最新版（%s），不用更新。%s" % (short_version(frm), kept_hint(installed)))
     ai = cfg.get("ai") or installed.get("ai")
     plan = plan_files(m, installed, ai, home_dir())
     staged = stage(src, m, {rel for rel, _, act in plan if act != "same"})
@@ -2197,6 +2249,7 @@ def update_run(cfg, o):
             record["file_hashes"][rel] = m["files"][rel]
     if rules["mode"] == "managed":
         record["rules_blocks"] = rules["record"]
+    record["kept_files"] = sorted(file_label(rel, dest) for rel, dest, act in plan if act == "keep")   # for /status
     writes = [(dest, staged[rel]) for rel, dest, act in plan if act in ("add", "replace")]
     writes += [(dest + ".new", staged[rel]) for rel, dest, act in plan if act == "keep"]
     # a <file>.new from an earlier update is stale once the file itself is current
@@ -2231,7 +2284,18 @@ def update_run(cfg, o):
     extra = [safely("套件", ensure_requirements, cfg, m["requirements"]), safely("安全防護", reinstall_guard, ai)]
     if not o["no_restart"]:
         extra.append(safely("背景程式", restart_background, cfg))
-    told = bool(rules.get("side")) and not o["no_notify"] and tell_ai(rules_note(rules, cfg))
+    kept = [(rel, dest) for rel, dest, act in plan if act == "keep"]
+    try:
+        side = write_kept_diff(frm, m, kept)
+    except Exception:
+        log(traceback.format_exc(), UPDATE_LOG)
+        side = None
+        try:                                            # never point anyone at an old diff
+            os.remove(KEPT_DIFF)
+        except OSError:
+            pass
+    notes =([rules_note(rules, cfg)] if rules.get("side") else []) + ([kept_note(kept, side, m, cfg)] if kept else [])
+    told = bool(notes) and not o["no_notify"] and tell_ai(" ".join(notes))
     return update_say(cfg, o, update_report(frm, m, plan, rules, extra, told, cfg))
 
 
@@ -2241,6 +2305,10 @@ def update_rollback(cfg, o):
         return update_say(cfg, o, "沒有可以還原的備份（還沒更新過，或已經還原過了）。", 1)
     bdir = os.path.join(BACKUPS, names[0])
     info = restore_backup(bdir)
+    try:
+        os.remove(KEPT_DIFF)
+    except OSError:
+        pass
     shutil.rmtree(bdir, ignore_errors=True)
     installed = load_json(INSTALLED, None) or {}
     ai = cfg.get("ai") or (installed.get("ai") if isinstance(installed, dict) else None)
@@ -2453,8 +2521,46 @@ def selftest():
         shutil.rmtree(BACKUPS)
         BACKUPS = saved
     selftest_logon_trigger()
+    selftest_kept_update()
     selftest_telegram()
     print("selftest ok")
+
+
+def selftest_kept_update():
+    """an update that could not replace a changed file says so first, writes the diff and tells the AI what to do"""
+    import tempfile
+    global BASE, KEPT_DIFF, INSTALLED
+    saved, d = (BASE, KEPT_DIFF, INSTALLED), tempfile.mkdtemp()
+    BASE, KEPT_DIFF, INSTALLED = d, os.path.join(d, "update-kept.md"), os.path.join(d, "installed.json")
+    try:
+        dest = agent_copy("tgterm.py")
+        write_text(dest, "a\nmine\nc\n")
+        write_text(dest + ".new", "a\nfix\nc\n")
+        m = {"version": "8276877" + "0" * 33, "notes": ["修正：重開機會自己開"], "files": {}}
+        plan = [("tgterm.py", dest, "keep"), ("guard.py", agent_copy("guard.py"), "replace")]
+        side = write_kept_diff("467f411" + "0" * 33, m, [("tgterm.py", dest)])
+        text = load_text(side)
+        assert side == KEPT_DIFF and "-mine" in text and "+fix" in text and "修正：重開機會自己開" in text, text
+        note = kept_note([("tgterm.py", dest)], side, m, {"token": "x"})
+        assert "tgterm.py" in note and side in note and "/allow" in note and "沒有同意前不要動" in note, note
+        r = update_report("467f411", m, plan, {"mode": "none"}, [], True, {"token": "x"})
+        first = r.split("\n")
+        assert first[0].startswith("⚠️ 更新只完成一部分") and "tgterm.py" in first[1] and "已請 AI" in first[1], r
+        assert "更新 1 個：guard.py" in r and "✅" not in first[0]
+        assert KEPT_DIFF in update_report("467f411", m, plan, {"mode": "none"}, [], False, {})   # AI not told: point at the diff
+        os.rename(KEPT_DIFF, KEPT_DIFF + ".x")
+        assert "比對旁邊的 .new 檔" in update_report("467f411", m, plan, {"mode": "none"}, [], False, {})   # no diff: no dead link
+        os.rename(KEPT_DIFF + ".x", KEPT_DIFF)
+        r2 = update_report("467f411", m, [plan[1]], {"mode": "none"}, [], False, {})
+        assert r2.startswith("✅ 更新完成") and "⚠️" not in r2, r2
+        save_json(INSTALLED, {"version": m["version"], "kept_files": ["tgterm.py"]})
+        assert version_text() == "8276877（tgterm.py 被改過、沒更新，新版在旁邊的 .new 檔）", version_text()
+        save_json(INSTALLED, {"version": m["version"], "kept_files": []})
+        assert version_text() == "8276877" and kept_hint(None) == ""
+        assert write_kept_diff("x", m, []) is None and not os.path.exists(KEPT_DIFF)   # stale diff removed
+    finally:
+        shutil.rmtree(d)
+        BASE, KEPT_DIFF, INSTALLED = saved
 
 
 def selftest_logon_trigger():
