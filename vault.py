@@ -456,11 +456,29 @@ class ChromeUI:
                 self.select(orig)
         return None, ""
 
+    def page_doc(self, w):
+        """the active tab's web page in the window's own tree: the DocumentControl named like the tab (window title
+        minus " - Google Chrome"). Exactly one or none, so the address bar and side panels (an AI chat box…) never count"""
+        title = (w.Name or "").rsplit(" - ", 1)[0]
+        docs = []
+
+        def walk(c, d=0):
+            if d > 30:
+                return
+            for ch in c.GetChildren():
+                if ch.ControlTypeName == "DocumentControl":
+                    if title and ch.Name == title:
+                        docs.append(ch)
+                else:
+                    walk(ch, d + 1)
+        walk(w)
+        return docs[0] if len(docs) == 1 else None
+
     def fields(self, w):
-        """the active tab's input boxes in page order; the page's accessibility tree opens on the first query, so retry"""
+        """the active tab's input boxes in page order. Chrome shows the page under Chrome_RenderWidgetHostHWND or (seen in
+        a second window on 11-05, that HWND hidden and empty) under a DocumentControl in the window's tree; it opens
+        the page's accessibility tree on the first query, so try both and retry"""
         hwnd = _u32.FindWindowExW(w.NativeWindowHandle, None, "Chrome_RenderWidgetHostHWND", None)
-        if not hwnd:
-            return []
         for _ in range(4):
             edits = []
 
@@ -471,7 +489,12 @@ class ChromeUI:
                     if ch.ControlTypeName == "EditControl" and ch.IsEnabled:
                         edits.append(ch)
                     walk(ch, d + 1)
-            walk(self.auto.ControlFromHandle(hwnd))
+            if hwnd:
+                walk(self.auto.ControlFromHandle(hwnd))
+            if not edits:
+                doc = self.page_doc(w)
+                if doc:
+                    walk(doc)
             if edits:
                 return edits
             time.sleep(1.2)
