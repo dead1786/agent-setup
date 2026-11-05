@@ -43,6 +43,8 @@ LAST_SENT = os.path.join(BASE, "last-sent")            # time of the latest repl
 FRESH = os.path.join(BASE, "fresh-start")              # next AI start opens a new conversation
 REMINDERS = os.path.join(BASE, "reminders.json")
 THREAD = os.path.join(BASE, "tg-thread.json")          # the topic of the owner's latest message (private-chat topics)
+TASK = "agent-watchdog"                                # the scheduled task bootstrap.ps1 registers
+LOGON_MARK = os.path.join(BASE, "logon-trigger")       # "ok …" once the task has its "at sign-in" trigger
 MUTEX = "Local\\agent-tgterm-bridge"
 # Claude Code's manual sign-in redirect (MANUAL_REDIRECT_URL in its source): the page shows a code to paste back
 MANUAL_REDIRECT = "https://platform.claude.com/oauth/code/callback"
@@ -1277,6 +1279,84 @@ def _fire_reminders(cfg):
         save_json(REMINDERS, {"items": keep})
 
 
+def task_xml_text(b):
+    """schtasks /XML output or a task file: UTF-16 (with or without BOM), else UTF-8, else the ANSI code page"""
+    if b[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return b.decode("utf-16")
+    if len(b) > 1 and b[1:2] == b"\x00":
+        return b.decode("utf-16-le")
+    for enc in ("utf-8-sig", "mbcs"):
+        try:
+            return b.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            pass
+    return b.decode("utf-8", "replace")
+
+
+def with_logon_trigger(xml):
+    """task XML plus an "at sign-in" trigger for the task's own user that repeats every minute; None if it has one"""
+    if "<LogonTrigger" in xml:
+        return None
+    if "</Triggers>" not in xml:
+        raise ValueError("no <Triggers> in the task XML")
+    m = re.search(r"<UserId>([^<]+)</UserId>", xml.split("<Principals>")[-1])
+    user = m.group(1) if m else "%s\\%s" % (os.environ.get("USERDOMAIN", ""), os.environ.get("USERNAME", ""))
+    user = user.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") if not m else user
+    trig = ("<LogonTrigger><Repetition><Interval>PT1M</Interval><StopAtDurationEnd>false</StopAtDurationEnd>"
+            "</Repetition><Enabled>true</Enabled><UserId>%s</UserId><Delay>PT15S</Delay></LogonTrigger>" % user)
+    xml = xml.replace("</Triggers>", trig + "</Triggers>", 1)
+    return re.sub(r'encoding="[^"]*"', 'encoding="UTF-16"', xml, count=1)
+
+
+def ensure_logon_trigger(task=TASK, run=subprocess.run):
+    """the task used to have only its every-minute timer; after one restart that timer never fired again (2060,
+    2026-11-05) and nothing reopened the AI window. An "at sign-in" trigger starts the watchdog at every sign-in.
+    Done once per install (LOGON_MARK); a failure is retried after 6 hours, not every minute. schtasks only."""
+    mark = load_text(LOGON_MARK).strip()
+    if mark.startswith("ok"):
+        return None
+    if mark.startswith("fail "):
+        try:
+            if time.time() - float(mark.split()[1]) < 6 * 3600:
+                return None
+        except (IndexError, ValueError):
+            pass
+    try:
+        out = add_logon_trigger(task, run)
+    except Exception as e:                              # schtasks missing, timeout...: back off like any failure
+        out = "error: %r" % e
+    with open(LOGON_MARK, "w", encoding="utf-8") as f:
+        f.write(("ok " if out.startswith("OK") else "fail %d " % time.time()) + out[:300])
+    return out
+
+
+def add_logon_trigger(task, run):
+    q = run(["schtasks.exe", "/Query", "/TN", task, "/XML"], capture_output=True, timeout=60,
+            creationflags=CREATE_NO_WINDOW)
+    if q.returncode != 0:
+        return "query failed (exit %d)" % q.returncode
+    try:
+        xml = with_logon_trigger(task_xml_text(q.stdout).strip().lstrip("﻿"))
+    except ValueError as e:
+        return str(e)
+    if xml is None:
+        return "OK: already there"
+    tmp = os.path.join(BASE, "watchdog-task.xml")
+    with open(tmp, "w", encoding="utf-16") as f:        # schtasks wants UTF-16 (the codec writes the BOM)
+        f.write(xml)
+    try:
+        c = run(["schtasks.exe", "/Create", "/TN", task, "/XML", tmp, "/F"], capture_output=True, timeout=60,
+                creationflags=CREATE_NO_WINDOW)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    if c.returncode != 0:
+        return "create failed (exit %d): %s" % (c.returncode, " ".join(task_xml_text(c.stdout + c.stderr).split())[:200])
+    return "OK: added"
+
+
 def watchdog():
     try:
         handoff_guard()                                 # runs even while paused
@@ -1284,6 +1364,12 @@ def watchdog():
         log("handoff guard: " + traceback.format_exc(), WATCHDOG_LOG)
     if os.path.exists(PAUSED):
         return
+    try:
+        out = ensure_logon_trigger()
+        if out:
+            log("logon trigger: " + out, WATCHDOG_LOG)
+    except Exception:
+        log("logon trigger: " + traceback.format_exc(), WATCHDOG_LOG)
     cfg = load_cfg()
     try:
         fire_reminders(cfg)
@@ -2366,8 +2452,58 @@ def selftest():
     finally:
         shutil.rmtree(BACKUPS)
         BACKUPS = saved
+    selftest_logon_trigger()
     selftest_telegram()
     print("selftest ok")
+
+
+def selftest_logon_trigger():
+    """the watchdog task's "at sign-in" trigger: XML edit and the once-only mark; schtasks is faked, never run"""
+    import tempfile
+    global LOGON_MARK, BASE
+    saved, d = (LOGON_MARK, BASE), tempfile.mkdtemp()
+    LOGON_MARK, BASE = os.path.join(d, "logon-trigger"), d
+    task = ('<?xml version="1.0" encoding="UTF-16"?><Task><Triggers><TimeTrigger><Repetition><Interval>PT1M</Interval>'
+            '</Repetition><StartBoundary>2026-11-01T14:44:00</StartBoundary><Enabled>true</Enabled></TimeTrigger>'
+            '</Triggers><Principals><Principal id="Author"><UserId>PC\\Kai</UserId><LogonType>InteractiveToken'
+            '</LogonType></Principal></Principals></Task>')
+    calls, created = [], []
+
+    class R:
+        def __init__(self, code, out=b""):
+            self.returncode, self.stdout, self.stderr = code, out, b""
+
+    def fake(args, **kw):
+        calls.append(args[1])
+        if args[1] == "/Query":
+            return R(0, ("﻿" + task).encode("utf-16-le"))
+        with open(args[args.index("/XML") + 1], "rb") as f:
+            created.append(task_xml_text(f.read()))
+        return R(0)
+    try:
+        x = with_logon_trigger(task)
+        assert x.index("<TimeTrigger>") < x.index("<LogonTrigger>") < x.index("</Triggers>"), x
+        assert "<UserId>PC\\Kai</UserId><Delay>PT15S</Delay></LogonTrigger>" in x and with_logon_trigger(x) is None
+        assert ensure_logon_trigger("t", fake) == "OK: added" and calls == ["/Query", "/Create"]
+        assert "<LogonTrigger>" in created[0] and created[0].count("<TimeTrigger>") == 1
+        assert load_text(LOGON_MARK).startswith("ok ") and not os.path.exists(os.path.join(d, "watchdog-task.xml"))
+        assert ensure_logon_trigger("t", fake) is None and len(calls) == 2           # once per install
+        os.remove(LOGON_MARK)
+        bad = lambda args, **kw: R(1)
+        assert ensure_logon_trigger("t", bad).startswith("query failed") and load_text(LOGON_MARK).startswith("fail ")
+        assert ensure_logon_trigger("t", fake) is None and len(calls) == 2           # failure: wait 6 hours
+        with open(LOGON_MARK, "w") as f:
+            f.write("fail %d x" % (time.time() - 7 * 3600))
+        assert ensure_logon_trigger("t", fake) == "OK: added"                         # then try again
+        os.remove(LOGON_MARK)
+
+        def boom(args, **kw):
+            raise subprocess.TimeoutExpired(args, 60)
+        assert ensure_logon_trigger("t", boom).startswith("error:") and load_text(LOGON_MARK).startswith("fail ")
+        assert task_xml_text("a".encode("utf-16")) == "a" and task_xml_text(b"abc") == "abc"
+    finally:
+        shutil.rmtree(d)
+        LOGON_MARK, BASE = saved
 
 
 def selftest_telegram():

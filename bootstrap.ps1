@@ -984,7 +984,8 @@ Step '看門狗排程（每分鐘：AI 視窗被關掉就重開、Telegram 橋�
     } catch { Say "    (battery settings not changed: $_)" 'Yellow' }
 }
 Step "開啟 AI 視窗「$agentName」" {
-    Remove-Item $Paused, (Join-Path $AgentDir 'watchdog.lock') -Force -ErrorAction SilentlyContinue
+    # logon-trigger: the task was just re-created without its "at sign-in" trigger; the watchdog below adds it again
+    Remove-Item $Paused, (Join-Path $AgentDir 'watchdog.lock'), (Join-Path $AgentDir 'logon-trigger') -Force -ErrorAction SilentlyContinue
     & $Py $Tgterm watchdog; Check 'watchdog'
     $ok = $false
     for ($i = 0; $i -lt 20 -and -not $ok; $i++) { Start-Sleep -Seconds 1; $ok = ((& $Py $Tgterm status | Out-String) -match 'agent_pid=\d+') }
