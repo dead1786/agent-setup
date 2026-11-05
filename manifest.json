@@ -1,7 +1,7 @@
 {
-  "version": "467f411cf2fe2a292de39c611867205dd3710fa9",
+  "version": "82768779fad91169ade559de4b82757e8fd8f231",
   "files": {
-    "tgterm.py": "408d8e1cac16ff93814cc0f0104dceecd6e308728516cb2dc3b9253ae9fb2dbb",
+    "tgterm.py": "468ca5675796be68f32946b19bf0a08f4db74daebe8342374000fdd803ba7af5",
     "winsend.py": "0089b099a5196819cb891a6339dc03508f23204743adaff4517979e8295e5fa1",
     "skills/winsend/SKILL.md": "1f52e2fc29145ab7fa1ca4ac1a39eac9910b5b49306cce2716e452ffd7ada891",
     "skills/memory-rag/SKILL.md": "21a521973b965eb624b0a1853e01299aefadbc1a2d793ca3bd3ac8cd6fb0de55",
@@ -20,6 +20,7 @@
   },
   "known": {
     "tgterm.py": [
+      "468ca5675796be68f32946b19bf0a08f4db74daebe8342374000fdd803ba7af5",
       "408d8e1cac16ff93814cc0f0104dceecd6e308728516cb2dc3b9253ae9fb2dbb",
       "402624a559961787cebb666fcc71c9abc14127dc18d23ebd574c7d41dcd9f71a",
       "f5b7e53ebb36a25df128e1d38dcdae8a75e8bebfa372759281114ce9f437d6b8",
@@ -92,7 +93,6 @@
     "pillow"
   ],
   "notes": [
-    "新功能：主題串（預設開）——在 @BotFather 幫你的 bot 開了「主題」後，AI 會回到你傳訊息的那個主題；沒開就跟以前一樣。/主題 可以開關",
-    "新功能：逐字顯示（預設關）——AI 回覆時一個字一個字冒出來；有些手機會卡住輸入，所以預設關，想試打 /串流 開"
+    "修正：電腦重開機後 AI 視窗有時不會自己開回來，現在登入 Windows 後就會自動開（更新後第一次執行會自動補上，不用另外設定）"
   ]
 }

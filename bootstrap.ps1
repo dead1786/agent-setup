@@ -38,9 +38,9 @@ $TaskName  = 'agent-watchdog'
 # the remote helper's Claude session (same account) that receives the setup report; it renames itself to this with /rename
 $Coordinator = if ($env:AGENT_SETUP_COORDINATOR) { $env:AGENT_SETUP_COORDINATOR } else { 'agent-coordinator' }
 # helper files, pinned to one commit and checked by SHA-256 (a CDN cache can never hand out another version)
-$PinCommit = '467f411cf2fe2a292de39c611867205dd3710fa9'
+$PinCommit = '82768779fad91169ade559de4b82757e8fd8f231'
 $PinFiles  = [ordered]@{
-    'tgterm.py'                  = '408d8e1cac16ff93814cc0f0104dceecd6e308728516cb2dc3b9253ae9fb2dbb'
+    'tgterm.py'                  = '468ca5675796be68f32946b19bf0a08f4db74daebe8342374000fdd803ba7af5'
     'winsend.py'                 = '0089b099a5196819cb891a6339dc03508f23204743adaff4517979e8295e5fa1'
     'skills/winsend/SKILL.md'    = '1f52e2fc29145ab7fa1ca4ac1a39eac9910b5b49306cce2716e452ffd7ada891'
     'skills/memory-rag/SKILL.md' = '21a521973b965eb624b0a1853e01299aefadbc1a2d793ca3bd3ac8cd6fb0de55'
