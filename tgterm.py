@@ -26,6 +26,8 @@
 #   stream   default off: `send` first grows the reply in a draft bubble (sendMessageDraft, ~2.5 s), then sends it
 #   topics   default on: replies go to the private-chat topic the owner wrote in last (topic mode is turned on by the
 #            owner in @BotFather; without it, or outside a topic, nothing changes)
+# Password vault: /vault (/密碼) goes to vault.py beside this file and never to the AI, a log or the inbox; the bridge
+# also receives the ✅ / ❌ taps (callback queries) that `vault.py fill` asks for and records them with vault.decide().
 import ctypes, hashlib, json, os, re, shutil, subprocess, sys, threading, time, traceback, urllib.error, urllib.parse
 import urllib.request, uuid
 from ctypes import wintypes
@@ -824,11 +826,16 @@ COMMANDS = [("status", "AI 狀態"), ("stop", "中斷 AI 正在做的事"), ("re
             ("new", "重開並開始新對話"), ("screen", "傳目前的電腦畫面"),
             ("allow", "放行安全防護剛擋下的動作一次"), ("update", "更新輔助程式（/update 還原＝退回上一版）"),
             ("stream", "回覆逐字顯示 開／關（預設關）"), ("topics", "回在你傳訊息的主題 開／關"),
+            ("vault", "密碼庫：存網站帳密給 AI 幫你登入，AI 看不到密碼（/密碼 看用法）"),
             ("help", "指令說明")]
 HIDDEN_COMMANDS = ("rollback",)                         # not in the Telegram menu: /還原 or /update 還原
 ALIASES = {"狀態": "status", "停": "stop", "停止": "stop", "重開": "restart", "新對話": "new",
            "畫面": "screen", "截圖": "screen", "允許": "allow", "放行": "allow", "說明": "help",
-           "更新": "update", "還原": "rollback", "串流": "stream", "主題": "topics"}
+           "更新": "update", "還原": "rollback", "串流": "stream", "主題": "topics", "密碼": "vault", "密碼庫": "vault"}
+# /vault /密碼 /密碼庫, also with a full-width slash or no space before the sub-command ("/密碼新增 …"): the text may
+# hold a password, so it is matched loosely and handled before anything else (see vault_command)
+VAULT_TEXT = re.compile(r"[/／]\s*(?:vault|密碼)", re.I)
+ALLOWED_UPDATES = '["message","callback_query"]'        # callback_query: the vault's ✅ / ❌ buttons
 # the owner made, renamed, closed... a topic: nothing for the AI, nothing to answer
 TOPIC_EVENTS = ("forum_topic_created", "forum_topic_edited", "forum_topic_closed", "forum_topic_reopened",
                 "general_forum_topic_hidden", "general_forum_topic_unhidden")
@@ -977,7 +984,7 @@ def help_text():
             "\n".join("/%s  %s" % c for c in COMMANDS) +
             "\n/update 檢查  只看有沒有新版" +
             "\n/stream 開｜關、/topics 開｜關  直接指定（不加就是切換）" +
-            "\n（也可以打中文：/狀態 /停 /重開 /新對話 /畫面 /允許 /更新 /還原 /串流 /主題）")
+            "\n（也可以打中文：/狀態 /停 /重開 /新對話 /畫面 /允許 /更新 /還原 /串流 /主題 /密碼）")
 
 
 def toggles_text(cfg):
@@ -1001,6 +1008,91 @@ def toggle_reply(cfg, name, on):
         if bot is False else "")
 
 
+# ---------------------------------------------------------------- password vault (vault.py beside this file)
+_vault = []
+
+
+def load_vault():
+    """vault.py, loaded once; the bridge only calls owner_command() and decide() (no Chrome, no getUpdates there)"""
+    if not _vault:
+        import importlib.util
+        path = os.path.join(BASE, "vault.py")
+        spec = importlib.util.spec_from_file_location("agent_vault", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)                    # FileNotFoundError when vault.py is not installed
+        _vault.append(mod)
+    return _vault[0]
+
+
+def vault_command(cfg, m):
+    """/vault (/密碼): the owner stores, lists and deletes logins. The text may hold a password: it goes to vault.py and
+    nowhere else (not the AI, not a log, not the inbox), and a message that may hold one is deleted from the chat,
+    even when it is malformed or vault.py cannot be loaded. Errors are logged by type only."""
+    raw = m.get("text") or m.get("caption") or ""
+    try:
+        reply, drop = load_vault().owner_command(raw)
+    except Exception as e:
+        reply, drop = "密碼庫現在不能用（%s）。在 Telegram 打 /update 更新後再試。" % type(e).__name__, len(raw.split()) > 1
+    deleted = None
+    if drop:
+        try:
+            tg(cfg, "deleteMessage", chat_id=(m.get("chat") or {}).get("id"), message_id=m.get("message_id"))
+            deleted = True
+        except Exception as e:
+            deleted = False
+            log("vault: the owner's message was not deleted (%s)" % type(e).__name__)
+        reply += ("\n🧹 你剛傳的那則已經刪掉（裡面可能有密碼）" if deleted else
+                  "\n⚠️ 你剛傳的那則刪不掉，請自己長按刪除（裡面可能有密碼）")
+    try:
+        send(cfg, reply)
+    except Exception as e:
+        log("vault: reply failed (%s)" % type(e).__name__)
+    log("vault command%s" % {True: " (message deleted)", False: " (message NOT deleted)", None: ""}[deleted])
+
+
+def on_button(cfg, cq):
+    """a tap on an inline button: the vault's ✅ / ❌ that `vault.py fill` sent. Only the owner's taps count; the
+    answer is recorded only while the request still waits (vault.decide), then shown on the message"""
+    frm, data, msg, note = cq.get("from") or {}, str(cq.get("data") or ""), cq.get("message") or {}, ""
+    verdict, changed = "", False
+    try:
+        if frm.get("id") != cfg.get("owner_id") or (msg.get("chat") or {}).get("id", frm.get("id")) != frm.get("id"):
+            note = "只有主人能按"
+            log("ignored button from %s" % frm.get("id"))
+        elif data.startswith("vault:"):
+            _, req, verdict = (data.split(":") + ["", ""])[:3]
+            changed, note = load_vault().decide(req, verdict)
+            log("vault button %s: %s" % (verdict if verdict in ("ok", "no") else "?", "recorded" if changed else "too late"))
+        else:
+            note = "這個按鈕已經沒有作用了"
+    except Exception as e:
+        note = "出錯了（%s）" % type(e).__name__
+        log("button failed: %r" % e)
+    try:
+        tg(cfg, "answerCallbackQuery", callback_query_id=cq.get("id"), text=note[:190])
+    except Exception as e:
+        log("answerCallbackQuery: %r" % e)
+    where = {"chat_id": (msg.get("chat") or {}).get("id"), "message_id": msg.get("message_id")}
+    if not data.startswith("vault:") or not frm.get("id") == where["chat_id"] == cfg.get("owner_id") or not where["message_id"]:
+        return
+    try:
+        if changed:                                     # the answer stays on the message, the buttons go away
+            tg(cfg, "editMessageText", text=(msg.get("text") or "") + ("\n→ ✅ 已允許" if verdict == "ok" else "\n→ ❌ 已拒絕"),
+               **where)
+        else:                                           # a finished request: just take the buttons away
+            tg(cfg, "editMessageReplyMarkup", **where)
+    except Exception as e:
+        log("button message not edited: %r" % e)
+
+
+def dispatch(cfg, u):
+    """one update from getUpdates"""
+    if u.get("callback_query"):
+        on_button(cfg, u["callback_query"])
+    else:
+        handle(cfg, u.get("message") or {})
+
+
 def handle(cfg, m):
     chat, frm = m.get("chat") or {}, m.get("from") or {}
     if chat.get("type") != "private" or frm.get("id") != cfg.get("owner_id"):
@@ -1010,6 +1102,9 @@ def handle(cfg, m):
     if any(k in m for k in TOPIC_EVENTS):
         return
     text = (m.get("text") or m.get("caption") or "").strip()
+    if VAULT_TEXT.match(text):                          # may hold a password: never to the AI, a log or the inbox
+        vault_command(cfg, m)
+        return
     if text.startswith("/"):
         parts = text[1:].split(None, 1)
         name = parts[0].split("@")[0] if parts else ""
@@ -1105,12 +1200,12 @@ def bridge():
     while True:
         try:
             cfg = load_cfg()
-            res = tg(cfg, "getUpdates", offset=offset, timeout=50, allowed_updates='["message"]')
+            res = tg(cfg, "getUpdates", offset=offset, timeout=50, allowed_updates=ALLOWED_UPDATES)
             with _handling:
                 for u in res.get("result", []):
                     offset = u["update_id"] + 1
                     save_json(STATE, {"offset": offset})
-                    handle(cfg, u.get("message") or {})
+                    dispatch(cfg, u)
         except urllib.error.HTTPError as e:
             log("telegram http %s (409 = another program uses this bot)" % e.code)
             time.sleep(15)
@@ -1545,7 +1640,7 @@ SECTION_LINE = re.compile(r"^\{\{([#^])(\w+)\}\}\n(.*?)^\{\{/\2\}\}(?:\n|\Z)", r
 SECTION = re.compile(r"\{\{([#^])(\w+)\}\}(.*?)\{\{/\2\}\}", re.S)
 VAR = re.compile(r"\{\{(\w+)\}\}")
 LABELS = {"telegram": "Telegram", "reminders": "提醒與排程", "manuals": "說明書", "guard": "安全防護",
-          "first-meeting": "第一次見面"}
+          "vault": "密碼庫", "first-meeting": "第一次見面"}
 
 
 def fill(text, values):
@@ -1698,7 +1793,7 @@ UPDATE_FLAGS = ("check", "rollback", "telegram", "no_restart", "no_notify", "sta
 SUGGEST_HEAD = ("# 規則檔更新建議（版本 %s）\n\n"
                 "這是新版會寫進規則檔的段落。你的規則檔是舊版格式（沒有 agent-setup 標記），所以更新程式沒有動它。\n"
                 "請 AI 跟目前的規則檔比對、說明差在哪裡；主人同意後，用下面的段落取代規則檔裡對應的段落"
-                "（Telegram、提醒與排程、說明書、安全防護、第一次見面），保留主人自己加的內容，"
+                "（Telegram、提醒與排程、說明書、安全防護、密碼庫、第一次見面），保留主人自己加的內容，"
                 "並保留每段前後的 agent-setup 標記，之後的更新才能自動套用。\n\n")
 NEWSEC_HEAD = ("# 規則檔新版段落（版本 %s）\n\n"
                "規則檔裡這幾段被改過（或拿掉了），所以更新程式沒有覆蓋。請 AI 跟規則檔裡同名的段落比對、說明差在哪裡；"
@@ -2629,6 +2724,99 @@ def selftest_telegram():
     assert ALIASES["串流"] == "stream" and ALIASES["主題"] == "topics"
     assert all("/" + c in help_text() for c in names) and "/串流" in help_text() and "/主題" in help_text()
     assert all(re.fullmatch(r"[a-z0-9_]{1,32}", c) and 0 < len(t) <= 256 for c, t in COMMANDS)   # setMyCommands rules
+    assert "/密碼" in help_text() and all(VAULT_TEXT.match("/" + a) for a, v in ALIASES.items() if v == "vault")
+    assert not any(VAULT_TEXT.match("/" + a) for a, v in list(ALIASES.items()) + [(c, c) for c in names] if v != "vault")
+    selftest_vault()
+
+
+def selftest_vault():
+    """/vault and the ✅ / ❌ buttons: the text reaches vault.py only (never the AI, a log or the inbox) and a message
+    that may hold a password is deleted. Telegram, the AI window and vault.py are fakes; the real vault is never loaded"""
+    import tempfile
+    global LOG, INBOX, THREAD, tg, send, deliver, load_vault
+    saved, d = (LOG, INBOX, THREAD, tg, send, deliver, load_vault), tempfile.mkdtemp()
+    LOG, INBOX, THREAD = (os.path.join(d, n) for n in ("tgterm.log", "tg-inbox", "tg-thread.json"))
+    calls, sent, delivered, fail = [], [], [], set()
+    secret = "s3cr3t pa ss 密碼"
+
+    def fake_tg(cfg, method, _timeout=70, **params):
+        calls.append((method, params))
+        if method in fail:
+            raise urllib.error.HTTPError("https://api.telegram.org/x", 400, "Bad Request", None, None)
+        return {"ok": True, "result": True}
+
+    class FakeVault:
+        def __init__(self):
+            self.seen, self.taps = [], []
+
+        def owner_command(self, text):
+            self.seen.append(text)
+            return "✅ 已存", "新增" in text
+
+        def decide(self, req, verdict):
+            self.taps.append((req, verdict))
+            return (True, "已允許") if req == "0123456789ab" else (False, "這個請求已經結束了")
+
+    def missing():
+        raise FileNotFoundError("vault.py")
+    fv = FakeVault()
+    tg, send = fake_tg, lambda cfg, text, stream=False: sent.append(text)
+    deliver = lambda cfg, body, date=None: delivered.append(body)
+    cfg, owner = {"token": "t", "owner_id": 1}, {"chat": {"type": "private", "id": 1}, "from": {"id": 1}, "message_id": 9}
+    try:
+        load_vault = missing                            # vault.py not installed: still deleted, still not forwarded
+        handle(cfg, dict(owner, text="/密碼 新增 github github.com me " + secret))
+        assert calls == [("deleteMessage", {"chat_id": 1, "message_id": 9})] and "不能用" in sent[-1] and "已經刪掉" in sent[-1]
+        handle(cfg, dict(owner, text="/密碼"))
+        assert len(calls) == 1 and "不能用" in sent[-1] and "刪" not in sent[-1]
+        load_vault = lambda: fv
+        for text in ("／密碼新增 a b.com u " + secret, "/vault@my_bot add a b.com u " + secret, "/ 密碼庫 新增 x " + secret):
+            handle(cfg, dict(owner, text=text))
+            assert fv.seen[-1] == text and calls[-1] == ("deleteMessage", {"chat_id": 1, "message_id": 9}), text
+        handle(cfg, dict(owner, photo=[{"file_id": "f", "file_size": 1}], caption="/密碼 新增 p p.com u " + secret))
+        assert fv.seen[-1].endswith(secret) and calls[-1][0] == "deleteMessage"   # a caption too; the photo is not downloaded
+        n = len(calls)
+        handle(cfg, dict(owner, text="/vault 清單"))
+        assert fv.seen[-1] == "/vault 清單" and len(calls) == n and sent[-1] == "✅ 已存"
+        fail.add("deleteMessage")
+        handle(cfg, dict(owner, text="/密碼 新增 a b.com u " + secret))
+        assert "刪不掉" in sent[-1] and "NOT deleted" in load_text(LOG)
+        handle(cfg, {"chat": {"type": "private", "id": 2}, "from": {"id": 2}, "message_id": 3, "text": "/密碼 新增 " + secret})
+        assert len(fv.seen) == 6 and calls[-1][1].get("message_id") == 9   # someone else's: ignored
+        handle(cfg, dict(owner, text="密碼是 1234"))                    # not a command: goes to the AI as before
+        assert delivered == ["密碼是 1234"] and not os.path.exists(INBOX) and "getFile" not in [c for c, _ in calls]
+        assert secret not in load_text(LOG) and not any(secret in s for s in sent)
+
+        # buttons
+        del calls[:]
+        fail.clear()
+        msg = {"chat": {"id": 1}, "message_id": 5, "text": "🔐 AI 要把「github」的密碼填進 Chrome 的 github.com"}
+        tap = {"id": "c1", "from": {"id": 1}, "data": "vault:0123456789ab:ok", "message": msg}
+        dispatch(cfg, {"update_id": 1, "callback_query": tap})
+        assert fv.taps == [("0123456789ab", "ok")] and calls[0] == ("answerCallbackQuery", {"callback_query_id": "c1", "text": "已允許"})
+        assert calls[1][0] == "editMessageText" and calls[1][1]["text"].endswith("→ ✅ 已允許") and calls[1][1]["message_id"] == 5
+        del calls[:]
+        dispatch(cfg, {"update_id": 2, "callback_query": dict(tap, data="vault:aaaaaaaaaaaa:no")})   # finished already
+        assert calls[0][1]["text"] == "這個請求已經結束了" and calls[1][0] == "editMessageReplyMarkup" and len(calls) == 2
+        del calls[:]
+        dispatch(cfg, {"update_id": 3, "callback_query": dict(tap, **{"from": {"id": 2}})})          # not the owner
+        assert len(fv.taps) == 2 and calls == [("answerCallbackQuery", {"callback_query_id": "c1", "text": "只有主人能按"})]
+        del calls[:]
+        dispatch(cfg, {"update_id": 3, "callback_query": dict(tap, message=dict(msg, chat={"id": -100}))})  # not the private chat
+        assert len(fv.taps) == 2 and calls == [("answerCallbackQuery", {"callback_query_id": "c1", "text": "只有主人能按"})]
+        del calls[:]
+        dispatch(cfg, {"update_id": 4, "callback_query": dict(tap, data="other")})
+        assert calls == [("answerCallbackQuery", {"callback_query_id": "c1", "text": "這個按鈕已經沒有作用了"})]
+        del calls[:]
+        fail.add("editMessageText")
+        load_vault = missing
+        dispatch(cfg, {"update_id": 5, "callback_query": tap})          # vault.py broken: answered, buttons removed
+        assert calls[0][1]["text"] == "出錯了（FileNotFoundError）" and calls[1][0] == "editMessageReplyMarkup"
+        assert "callback_query" in json.loads(ALLOWED_UPDATES) and "message" in json.loads(ALLOWED_UPDATES)
+        assert len(delivered) == 1 and secret not in load_text(LOG)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+        LOG, INBOX, THREAD, tg, send, deliver, load_vault = saved
 
 
 def selftest_drafts():

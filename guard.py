@@ -4,7 +4,8 @@ The AI tool calls this before every action and gets a yes/no back. It stops the
 few things that can do real damage on the owner's PC: wiping files, formatting
 disks, force-pushing git, shutting the PC down, running scripts straight from the
 internet, reading saved passwords/tokens, adding MCP servers, and switching this
-guard off.
+guard off. The password vault (vault.py) may only be run as `fill` / `list`, and its
+folder is blocked even after /allow.
 
 It is a guard rail, not a sandbox: it reads the command text, so a script file
 that does something bad inside is not caught. When it blocks something the AI
@@ -33,6 +34,22 @@ SINK = os.path.join(BASE, "guard-blocked.txt")         # agy: where a blocked wr
 
 ASK_OWNER = ("先用 Telegram 問主人：要做什麼、為什麼要做。主人回 /allow 之後，10 分鐘內重試一次就會放行（只放行一次）。"
              "主人沒同意就換別的做法，不要繞過這個保護。")
+
+# the password vault (vault.py): the AI may only run `vault.py fill …` / `vault.py list`; the owner taps ✅ on Telegram
+# for every fill. Its folder (the encrypted store, the pending approvals) is blocked even with /allow.
+VAULT_DIR = re.compile(r'(?:\.agent|/agent~\d+)/+vault(?![\w.-])|(?:^|[^\w.-])vault/+requests(?![\w.-])|(?<![\w-])vault\.dat\b', re.I)
+VAULT_CODE = re.compile(r'\bimport\s+vault\b|\bfrom\s+vault\s+import\b|(?:import_module|__import__)\(\s*["\']vault["\']|'
+                        r'(?:spec_from_file_location|run_path|open)\([^)\n]*vault\.py', re.I)
+VAULT_TOOL = re.compile(r'(?:^|[/\s"\'=])vault\.py\b|' + VAULT_CODE.pattern, re.I)
+VAULT_RUN = re.compile(r'^\s*(?:&\s*)?["\']?[^"\'\s]*(?:pythonw?|py)(?:\.exe)?["\']?\s+(?:-X\s+utf8\s+)?["\']?[^"\'\s]*\.agent/'
+                       r'vault\.py["\']?\s+(?:fill\s+["\']?[^\s"\'-]|list\s*$)[^;&|<>`$(){}\r\n]*$', re.I)
+VAULT_BLOCKED = "碰密碼庫資料夾（C:\\AI\\.agent\\vault）"
+VAULT_RUN_ONLY = ("密碼庫程式只能單獨這樣用：C:\\AI\\.agent\\py\\Scripts\\python.exe C:\\AI\\.agent\\vault.py fill 名稱 "
+                  "[--only user|pass] [--tab 分頁標題開頭]，或把 fill 名稱 換成 list；不能 import、讀它、串其他指令或把輸出轉到檔案")
+VAULT_IN_FILE = "寫進檔案的內容會碰到密碼庫（資料夾或 vault 模組）"
+HARD = (VAULT_BLOCKED,)                                 # /allow does not open these
+VAULT_HINT = ("這個不能用 /allow 放行。要登入網站就執行 vault.py fill 名稱（主人在 Telegram 按允許才會填，你看不到密碼）；"
+              "需要新的帳密，請主人在 Telegram 用 /密碼 新增 存，不要叫主人把密碼傳給你。")
 
 
 def log(msg):
@@ -120,7 +137,7 @@ WILDCARD_DELETE = re.compile(r'(?:^|[\s(&;])(?:rm(?:\.exe)?|remove-item|ri|del|e
 PS_VALUE_FLAGS ={"-erroraction", "-ea", "-include", "-exclude", "-filter", "-warningaction", "-wa"}
 
 # files that keep the AI running or hold secrets
-AGENT_FILES = r'(?:tgterm\.py|guard\.py|winsend\.py|run-agent\.ps1|handoff\.ps1|installed\.json|agent-login-url|guard\.log)'
+AGENT_FILES = r'(?:tgterm\.py|guard\.py|winsend\.py|vault\.py|run-agent\.ps1|handoff\.ps1|installed\.json|agent-login-url|guard\.log)'
 SECRET_PATHS = re.compile(
     r'(?:^|[/\s"\'])\.ssh(?:/(?!config\b|known_hosts\b|[^\s"\'/]*\.pub\b)|$|[\s"\'])|/\.claude/\.credentials\.json|\.credentials\.json|/\.codex/auth\.json|oauth_creds\.json|'
     r'google_accounts\.json|/\.gemini/[^\s"\']*(?:token|credential)|c:/ai/\.agent/config\.json|'
@@ -169,9 +186,13 @@ def delete_targets(seg):
 def check_shell(cmd):
     """return a reason string when the shell command should be blocked"""
     text = cmd if isinstance(cmd, str) else " ".join(map(str, cmd or []))
+    if VAULT_DIR.search(text.replace("\\", "/")):      # even inside quotes or a message (a quoted path still works)
+        return VAULT_BLOCKED
     if MESSAGE_TOOLS.search(text) and not re.search(r'&&|\|\||;|\n', QUOTED.sub('""', text)) and not SUBSTITUTION.search(text):
         text = QUOTED.sub('""', text)                  # message text may mention anything
     flat = text.replace("\\", "/")
+    if VAULT_TOOL.search(flat) and not VAULT_RUN.match(flat):
+        return VAULT_RUN_ONLY
     for seg in segments(flat):
         for rx, desc in SHELL_RULES:
             if rx.search(seg):
@@ -234,10 +255,15 @@ def check_path(path, content="", write=False):
     p = norm(path)
     if not p:
         return None
+    if VAULT_DIR.search(p):
+        return VAULT_BLOCKED
     if SECRET_PATHS.search(p):
         return "碰到存密碼的檔案。" + SECRETS_HINT
     if not write:
         return None
+    flat = str(content or "").replace("\\", "/")
+    if VAULT_DIR.search(flat) or VAULT_CODE.search(flat):   # a script that would read the store or answer for the owner
+        return VAULT_IN_FILE
     base = p.rsplit("/", 1)[-1]
     if base in ("allow-once",) or (p.startswith("c:/ai/.agent/") and re.fullmatch(AGENT_FILES, base)):
         return "修改 AI 自己的運作檔案（Telegram 連線、安全防護、啟動腳本）"
@@ -299,8 +325,19 @@ def check_tool(name, args):
             content = "%s %s %s" % (args.get("old_string", ""), args.get("new_string", ""), args.get("new_source", ""))
         return check_path(path, content, write=True)
     if name in ("Read", "Grep", "Glob", "NotebookRead"):
+        paths = [norm(args.get(k)) for k in ("file_path", "path", "notebook_path")]
+        pattern = norm(args.get({"Glob": "pattern", "Grep": "glob"}.get(name, "")))
+        if pattern:                                     # a pattern on its own, and relative to the searched folder
+            paths += [pattern, paths[1] + "/" + pattern]
+        if any(VAULT_DIR.search(p) for p in paths):
+            return VAULT_BLOCKED
         return check_path(args.get("file_path") or args.get("path") or args.get("notebook_path") or "")
     return None
+
+
+def is_hard(reason):
+    """blocked even after the owner's /allow"""
+    return reason in HARD
 
 
 AGY_WRITE = re.compile(r'write|replace|edit|create|delete|move|rename|patch', re.I)
@@ -365,9 +402,9 @@ def _pre(data):
         call = data.get("toolCall") or {}
         reason, overwrite = check_agy(call)
         what = json.dumps(call, ensure_ascii=False)
-        if reason and not allowed_once(reason, what):
+        if reason and (is_hard(reason) or not allowed_once(reason, what)):
             log("BLOCKED agy %s: %s | %s" % (call.get("name"), reason, what[:300]))
-            res = {"decision": "deny", "reason": "[安全防護] 已擋下：%s。%s" % (reason, ASK_OWNER)}
+            res = {"decision": "deny", "reason": "[安全防護] 已擋下：%s。%s" % (reason, VAULT_HINT if is_hard(reason) else ASK_OWNER)}
             if overwrite:
                 res["overwrite"] = overwrite
             out(res)
@@ -377,10 +414,11 @@ def _pre(data):
     name, args = data.get("tool_name"), data.get("tool_input")
     reason = check_tool(name, args)
     what = json.dumps(args, ensure_ascii=False) if not isinstance(args, str) else args
-    if reason and not allowed_once(reason, what):
+    if reason and (is_hard(reason) or not allowed_once(reason, what)):   # a hard block never uses up the /allow
         log("BLOCKED %s: %s | %s" % (name, reason, what[:300]))
         out({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                                    "permissionDecisionReason": "[安全防護] 已擋下：%s。%s" % (reason, ASK_OWNER)}})
+                                    "permissionDecisionReason": "[安全防護] 已擋下：%s。%s" % (
+                                        reason, VAULT_HINT if is_hard(reason) else ASK_OWNER)}})
 
 
 def now_text():
@@ -461,6 +499,51 @@ def selftest():
         ("Bash", {"command": "echo evil | tee python C:/AI/.agent/tgterm.py send"}),
         ("PowerShell", {"command": "$p = 'C:\\AI\\.agent\\run-agent.ps1'\nSet-Content $p 'x'\n& C:\\AI\\.agent\\py\\Scripts\\python.exe C:\\AI\\.agent\\tgterm.py send \"ok\""}),
     ]
+    # the password vault: its folder (hard: even /allow does not open it) ...
+    vault_hard = [
+        ("Read", {"file_path": "C:\\AI\\.agent\\vault\\vault.dat"}),
+        ("Read", {"file_path": "C:\\AI\\.agent\\vault\\requests\\0123456789ab.json"}),
+        ("Grep", {"pattern": "pending", "path": "C:\\AI\\.agent\\vault"}),
+        ("Grep", {"pattern": "x", "path": "C:\\AI\\.agent", "glob": "vault/**"}),
+        ("Glob", {"pattern": "C:/AI/.agent/vault/**"}),
+        ("Glob", {"pattern": "*", "path": "C:\\AI\\.agent\\vault\\requests"}),
+        ("Write", {"file_path": "C:\\AI\\.agent\\vault\\requests\\0123456789ab.json", "content": "{\"status\": \"ok\"}"}),
+        ("PowerShell", {"command": "Get-Content C:\\AI\\.agent\\vault\\usage.log"}),
+        ("PowerShell", {"command": "Set-Content C:\\AI\\.agent\\vault\\requests\\0123456789ab.json '{\"status\":\"ok\"}'"}),
+        ("Bash", {"command": "cd C:/AI/.agent && cat vault/requests/x.json"}),
+        ("Bash", {"command": "copy vault.dat C:\\AI\\x.dat"}),
+        ("Bash", {"command": "type C:\\AI\\AGENT~1\\vault\\usage.log"}),
+        ("Bash", {"command": "python C:\\AI\\.agent\\tgterm.py send --file \"C:\\AI\\.agent\\vault\\vault.dat\""}),
+        ("apply_patch", {"command": "*** Begin Patch\n*** Add File: C:\\AI\\.agent\\vault\\requests\\a.json\n+{}\n*** End Patch"}),
+    ]
+    # ... and its program: only `vault.py fill …` / `vault.py list`, alone (these can be opened with /allow)
+    block += [
+        ("Write", {"file_path": "C:\\AI\\.agent\\vault.py", "content": "x"}),
+        ("Edit", {"file_path": "C:\\AI\\.agent\\vault.py", "old_string": "a", "new_string": "b"}),
+        ("PowerShell", {"command": "Set-Content C:\\AI\\.agent\\vault.py 'x'"}),
+        ("Bash", {"command": "type C:\\AI\\.agent\\vault.py"}),
+        ("Bash", {"command": "cd C:/AI/.agent && python -c \"import vault; print(vault._load())\""}),
+        ("Bash", {"command": "python -c \"import sys; sys.path.insert(0, r'C:\\AI\\.agent'); from vault import _load; print(_load())\""}),
+        ("Bash", {"command": "python -c \"import importlib; importlib.import_module('vault').list_entries()\""}),
+        ("Bash", {"command": "python -c \"import runpy; runpy.run_path(r'C:\\AI\\.agent\\vault.py')\""}),
+        ("Bash", {"command": "python C:\\AI\\.agent\\vault.py fill github; type x"}),
+        ("Bash", {"command": "python C:\\AI\\.agent\\vault.py fill github > out.txt"}),
+        ("Bash", {"command": "python C:\\AI\\.agent\\vault.py list 2>&1"}),
+        ("Bash", {"command": "python C:\\AI\\.agent\\vault.py fill github | clip"}),
+        ("Bash", {"command": "python C:\\AI\\.agent\\vault.py fill github && echo done"}),
+        ("PowerShell", {"command": "python C:\\AI\\.agent\\vault.py fill $(Get-Content x)"}),
+        ("PowerShell", {"command": "python C:\\AI\\.agent\\vault.py fill (gc x)"}),
+        ("Bash", {"command": "python C:\\AI\\.agent\\vault.py show github"}),
+        ("Bash", {"command": "python C:\\AI\\.agent\\vault.py fill --only pass"}),
+        ("Bash", {"command": "python C:\\AI\\.agent\\vault.py fill github\nrm notes.txt"}),
+        ("Bash", {"command": "python C:\\AI\\.agent\\vault.py selftest"}),
+        ("Bash", {"command": "python C:\\AI\\work\\vault.py fill github"}),          # only the installed one
+        ("Bash", {"command": "python vault.py fill github"}),
+        ("Write", {"file_path": "C:\\AI\\work\\peek.py", "content": "import sys\nsys.path.insert(0, r'C:\\AI\\.agent')\nimport vault\nprint(vault._load())"}),
+        ("Write", {"file_path": "C:\\AI\\work\\ok.py", "content": "import os\nopen(os.path.join(r'C:\\AI\\.agent\\vault\\requests', 'a.json'), 'w')"}),
+        ("apply_patch", {"command": "*** Begin Patch\n*** Add File: C:\\AI\\app\\x.py\n+from vault import _load\n*** End Patch"}),
+    ]
+    block += vault_hard
     allow = [
         ("Bash", {"command": "git log --format=%H -3"}),
         ("PowerShell", {"command": "Get-ChildItem | Format-List"}),
@@ -503,11 +586,27 @@ def selftest():
         ("Bash", {"command": "Set-Content -LiteralPath C:\\AI\\memory\\owner.md -Value '主人資料' -Encoding UTF8; "
                              "& 'C:\\AI\\.agent\\py\\Scripts\\python.exe' 'C:\\AI\\.agent\\tgterm.py' send \"記好了\""}),
         ("Bash", {"command": "echo hi > C:/AI/memory/a.md && /c/AI/.agent/py/Scripts/python.exe C:/AI/.agent/tgterm.py send \"done\""}),
+        # the password vault, used the way it is meant to be
+        ("Bash", {"command": "python C:\\AI\\.agent\\vault.py fill github"}),
+        ("PowerShell", {"command": "C:\\AI\\.agent\\py\\Scripts\\python.exe C:\\AI\\.agent\\vault.py fill \"My.Bank\" --only pass --tab \"網路銀行 登入\""}),
+        ("PowerShell", {"command": "& 'C:\\AI\\.agent\\py\\Scripts\\python.exe' 'C:\\AI\\.agent\\vault.py' list"}),
+        ("Bash", {"command": "/c/AI/.agent/py/Scripts/python.exe C:/AI/.agent/vault.py fill github --tab GitHub"}),
+        ("Bash", {"command": "python -X utf8 C:\\AI\\.agent\\vault.py list"}),
+        ("Bash", {"command": "python C:\\AI\\.agent\\tgterm.py send \"已用 vault.py fill github 填好帳密，要我按登入嗎？\""}),
+        ("Read", {"file_path": "C:\\AI\\.agent\\vault.py"}),
+        ("Write", {"file_path": "C:\\AI\\memory\\notes.md", "content": "github 的帳密在密碼庫：C:\\AI\\.agent\\vault.py fill github"}),
+        ("Bash", {"command": "pytest tests/test_vault.py -q"}),
+        ("Bash", {"command": "docker run -d vaultwarden/server"}),
+        ("Glob", {"pattern": "**/*.py", "path": "C:\\AI\\app"}),
+        ("Grep", {"pattern": "vault", "path": "C:\\AI\\app", "glob": "*.md"}),
     ]
     agy_block = [
         {"name": "run_command", "args": {"CommandLine": "Remove-Item C:\\Users\\me\\Documents -Recurse -Force"}},
         {"name": "view_file", "args": {"AbsolutePath": "C:\\AI\\.agent\\config.json"}},
         {"name": "write_to_file", "args": {"TargetFile": "C:\\Users\\me\\.gemini\\config\\hooks.json", "CodeContent": "{}"}},
+        {"name": "view_file", "args": {"AbsolutePath": "C:\\AI\\.agent\\vault\\vault.dat"}},
+        {"name": "run_command", "args": {"CommandLine": "type C:\\AI\\.agent\\vault\\requests\\a.json"}},
+        {"name": "run_command", "args": {"CommandLine": "python -c \"import vault\""}},
     ]
     agy_allow = [
         {"name": "run_command", "args": {"CommandLine": "git status"}},
@@ -529,11 +628,42 @@ def selftest():
         r = check_agy(call)[0]
         if r:
             bad.append("should allow (agy): %s -> %s" % (call, r))
-    total = len(block) + len(allow) + len(agy_block) + len(agy_allow)
+    for name, args in block:                            # only the vault folder is a hard block
+        if is_hard(check_tool(name, args)) != ((name, args) in vault_hard):
+            bad.append("hard block %s: %s %s" % ("expected" if (name, args) in vault_hard else "unexpected", name, args))
+    bad += selftest_allow_once()
+    total = len(block) * 2 + len(allow) + len(agy_block) + len(agy_allow) + 4
     for b in bad:
         print("FAIL", b)
     print("guard selftest: %d/%d ok" % (total - len(bad), total))
     return 1 if bad else 0
+
+
+def selftest_allow_once():
+    """a hard block ignores the owner's /allow and leaves it for the next normal block (temp files, output captured)"""
+    import shutil, tempfile
+    global ALLOW, LOG, out
+    saved, d, got, bad = (ALLOW, LOG, out), tempfile.mkdtemp(), [], []
+    ALLOW, LOG, out = os.path.join(d, "allow-once"), os.path.join(d, "guard.log"), got.append
+    try:
+        open(ALLOW, "w").close()
+        _pre({"tool_name": "Read", "tool_input": {"file_path": "C:\\AI\\.agent\\vault\\vault.dat"}})
+        reason = got[-1]["hookSpecificOutput"]["permissionDecisionReason"] if got else ""
+        if not (len(got) == 1 and "不能用 /allow" in reason and os.path.exists(ALLOW)):
+            bad.append("hard block: %r allow-once kept=%s" % (got, os.path.exists(ALLOW)))
+        _pre({"toolCall": {"name": "view_file", "args": {"AbsolutePath": "C:\\AI\\.agent\\vault\\vault.dat"}}})
+        if not (len(got) == 2 and got[-1].get("decision") == "deny" and os.path.exists(ALLOW)):
+            bad.append("hard block (agy): %r" % got[-1:])
+        _pre({"tool_name": "Bash", "tool_input": {"command": "type C:\\AI\\.agent\\vault.py"}})
+        if len(got) != 2 or os.path.exists(ALLOW):     # a normal block: the owner's /allow lets it through once
+            bad.append("normal block after /allow: %r allow-once left=%s" % (got[2:], os.path.exists(ALLOW)))
+        _pre({"tool_name": "Bash", "tool_input": {"command": "type C:\\AI\\.agent\\vault.py"}})
+        if len(got) != 3:
+            bad.append("second try without /allow was not blocked")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+        ALLOW, LOG, out = saved
+    return bad
 
 
 # ---------------------------------------------------------------- install / remove
