@@ -1453,6 +1453,20 @@ def add_logon_trigger(task, run):
     return "OK: added"
 
 
+def ensure_search_ignore(base=BASE):
+    """Grep (ripgrep) reads hidden files too: a search from the AI's working folder (C:\\AI) would read this folder
+    (Telegram key, vault). `.agent/` in C:\\AI\\.ignore makes ripgrep skip it; guard.py blocks such searches until
+    the line is there. Keeps whatever else the file holds."""
+    parent, name = os.path.split(os.path.abspath(base).rstrip("\\/"))
+    path = os.path.join(parent, ".ignore")
+    text = load_text(path)
+    if any(l.strip().strip("/").lower() == name.lower() for l in text.splitlines()):
+        return None
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(("" if not text or text.endswith("\n") else "\n") + name + "/\n")
+    return "added %s/ to %s" % (name, path)
+
+
 def watchdog():
     try:
         handoff_guard()                                 # runs even while paused
@@ -1460,6 +1474,12 @@ def watchdog():
         log("handoff guard: " + traceback.format_exc(), WATCHDOG_LOG)
     if os.path.exists(PAUSED):
         return
+    try:
+        out = ensure_search_ignore()
+        if out:
+            log("search ignore: " + out, WATCHDOG_LOG)
+    except Exception:
+        log("search ignore: " + traceback.format_exc(), WATCHDOG_LOG)
     try:
         out = ensure_logon_trigger()
         if out:
@@ -2616,6 +2636,7 @@ def selftest():
         shutil.rmtree(BACKUPS)
         BACKUPS = saved
     selftest_logon_trigger()
+    selftest_search_ignore()
     selftest_kept_update()
     selftest_telegram()
     print("selftest ok")
@@ -2656,6 +2677,23 @@ def selftest_kept_update():
     finally:
         shutil.rmtree(d)
         BASE, KEPT_DIFF, INSTALLED = saved
+
+
+def selftest_search_ignore():
+    """C:\\AI\\.ignore gets `.agent/` once and keeps the owner's own lines (a temp folder stands in for C:\\AI)"""
+    import tempfile
+    d = tempfile.mkdtemp()
+    try:
+        base = os.path.join(d, ".agent")
+        os.makedirs(base)
+        assert ensure_search_ignore(base).startswith("added") and load_text(os.path.join(d, ".ignore")) == ".agent/\n"
+        assert ensure_search_ignore(base) is None                                   # once
+        with open(os.path.join(d, ".ignore"), "w", encoding="utf-8") as f:
+            f.write("node_modules")                                                 # the owner's file, no last newline
+        assert ensure_search_ignore(base).startswith("added")
+        assert load_text(os.path.join(d, ".ignore")) == "node_modules\n.agent/\n"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def selftest_logon_trigger():

@@ -17,8 +17,10 @@ within 10 minutes.
   guard.py invoke     agy PreInvocation: tell the AI the current time
   guard.py selftest   run the built-in checks
 """
+import fnmatch
 import json
 import os
+import posixpath
 import re
 import subprocess
 import sys
@@ -147,6 +149,16 @@ SECRET_PATHS = re.compile(
 SECRETS_HINT = "這是存密碼／登入憑證的檔案（Telegram 金鑰、AI 登入、瀏覽器密碼、SSH 金鑰等）。查狀態請用 tgterm.py status，不要讀它。"
 GUARD_CONFIG = re.compile(r'/\.codex/hooks\.json$|/\.gemini/config/hooks\.json$|/\.claude/settings(?:\.local)?\.json$', re.I)
 MCP_CONFIG = re.compile(r'(?:^|/)\.mcp\.json$|/\.claude\.json$|/\.codex/config\.toml$|/\.gemini/config/mcp_config\.json$', re.I)
+# Grep reads every file under the folder it searches, hidden ones too (11-06: a report showed Grep with
+# glob=".credentials.json" in ~/.claude printing the login token). Folders that hold secrets, or contain them:
+HOME_DIR = re.compile(r'^[a-z]:/users/[^/]+')
+HOME_SECRET_DIRS = (".ssh", ".gemini", "appdata/local/google/chrome/user data", "appdata/local/microsoft/edge/user data",
+                    "appdata/local/bravesoftware/brave-browser/user data", "appdata/roaming/mozilla/firefox/profiles",
+                    "appdata/roaming/microsoft/credentials", "appdata/local/microsoft/credentials",
+                    "appdata/roaming/microsoft/protect")
+HOME_SECRET_FILES = (".claude/.credentials.json", ".codex/auth.json")
+SEARCH_HINT = ("這個資料夾底下有存密碼的檔案（AI 登入、Telegram 金鑰、瀏覽器密碼、SSH 金鑰）。"
+               "請改搜比較小的資料夾，或用 glob 指定要搜的檔案類型（例如 *.py）。")
 
 
 def segments(cmd):
@@ -278,6 +290,82 @@ def check_path(path, content="", write=False):
     return None
 
 
+def win_path(p):
+    p = re.sub(r'^//[?.]/', '', re.sub(r'^//[?.]/unc/', '//', norm(p)))    # \\?\C:\…, \\?\UNC\server\…
+    if p.startswith("~"):
+        p = HOME + p[1:]
+    m = re.match(r'^/([a-z])(?=/|$)', p)                # /c/Users → c:/Users (Git Bash)
+    return m.group(1) + ":" + p[2:] if m else p
+
+
+def search_root(path, cwd):
+    """the folder a Grep reads: its path (relative ones from the working folder), else the working folder"""
+    p, c = win_path(path), win_path(cwd)
+    if p and not re.match(r'^[a-z]:|//', p):
+        p = c + "/" + p if c else ""
+    elif not p:
+        p = c
+    if not p:
+        return ""
+    p = posixpath.normpath(p)
+    try:                                                # C:\Users\KAI~1, junctions, links: the folder it really is
+        if os.path.exists(p):
+            p = win_path(os.path.realpath(p))
+    except (OSError, ValueError):
+        pass
+    return p.rstrip("/")
+
+
+def glob_hits(pat, rel):
+    """could ripgrep's --glob take this file? Unsure (negation, braces) counts as yes"""
+    if not pat or pat.startswith("!") or "{" in pat:
+        return True
+    p = pat.lstrip("/")
+    base = rel.rsplit("/", 1)[-1]
+    return any(fnmatch.fnmatchcase(x, y) for x in (rel, base) for y in (p, p.replace("**/", "")))
+
+
+def ignored_by(parent, name):
+    """ripgrep skips a folder named in .ignore; a --glob cannot bring back a file inside a skipped folder"""
+    for f in (".ignore", ".rgignore"):
+        try:
+            with open(os.path.join(parent, f), encoding="utf-8", errors="replace") as fh:
+                if any(line.strip().strip("/").lower() == name for line in fh):
+                    return True
+        except OSError:
+            pass
+    return False
+
+
+def check_search(root, pat, agents=None):
+    """Grep: the folder it searches must not be, or contain, a place that holds secrets"""
+    if not root:
+        return None
+    pre = "" if root.endswith(":") else "/"
+    under = lambda place: place == root or place.startswith(root + pre)     # the place is in the searched folder
+    inside = lambda place: root == place or root.startswith(place + "/")
+    real = lambda q: win_path(os.path.realpath(q)).rstrip("/")
+    for agent in agents or {real(BASE), "c:/ai/.agent"}:       # the AI's own folder: Telegram key, vault
+        parent, name = agent.rsplit("/", 1)
+        if inside(agent) or (under(agent) and (not ignored_by(parent, name) or name in pat)):
+            return "搜尋 AI 自己的設定資料夾（裡面有 Telegram 金鑰）。" + SEARCH_HINT
+    homes = {HOME.rstrip("/"), real(HOME)}
+    m = HOME_DIR.match(root)
+    if m:
+        homes.add(m.group(0))
+    for home in homes:
+        if under(home):
+            return "搜尋整個使用者資料夾。" + SEARCH_HINT
+        for rel in HOME_SECRET_DIRS:
+            if inside(home + "/" + rel) or under(home + "/" + rel):
+                return "搜尋存密碼的資料夾。" + SEARCH_HINT
+        for rel in HOME_SECRET_FILES:
+            place = home + "/" + rel
+            if under(place) and glob_hits(pat, place[len(root) + 1:]):
+                return "搜尋的範圍會讀到登入憑證檔。" + SEARCH_HINT
+    return None
+
+
 def full_write_drops_guard(path, content):
     """a whole-file rewrite of the Claude settings that no longer runs this guard"""
     p = norm(path)
@@ -297,8 +385,8 @@ def patch_files(patch):
 
 
 # ---------------------------------------------------------------- dispatch
-def check_tool(name, args):
-    """name/args in Claude/Codex shape; returns a reason or None"""
+def check_tool(name, args, cwd=""):
+    """name/args in Claude/Codex shape (cwd: the AI's working folder); returns a reason or None"""
     name = name or ""
     args = args if isinstance(args, dict) else {}
     if name in ("Bash", "PowerShell", "shell", "local_shell", "exec_command"):
@@ -331,7 +419,12 @@ def check_tool(name, args):
             paths += [pattern, paths[1] + "/" + pattern]
         if any(VAULT_DIR.search(p) for p in paths):
             return VAULT_BLOCKED
-        return check_path(args.get("file_path") or args.get("path") or args.get("notebook_path") or "")
+        for p in paths:                                 # the filter can name a secret file as well as the path
+            r = check_path(p)
+            if r:
+                return r
+        if name == "Grep":
+            return check_search(search_root(args.get("path"), cwd), pattern)
     return None
 
 
@@ -412,7 +505,7 @@ def _pre(data):
             out({"decision": "allow"})                 # agy runs with --dangerously-skip-permissions anyway
         return
     name, args = data.get("tool_name"), data.get("tool_input")
-    reason = check_tool(name, args)
+    reason = check_tool(name, args, data.get("cwd") or "")
     what = json.dumps(args, ensure_ascii=False) if not isinstance(args, str) else args
     if reason and (is_hard(reason) or not allowed_once(reason, what)):   # a hard block never uses up the /allow
         log("BLOCKED %s: %s | %s" % (name, reason, what[:300]))
@@ -476,6 +569,18 @@ def selftest():
         ("Read", {"file_path": "C:\\AI\\.agent\\config.json"}),
         ("Read", {"file_path": "C:\\Users\\me\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Login Data"}),
         ("Grep", {"pattern": "x", "path": "C:\\Users\\me\\.ssh"}),
+        # a search that reaches a secret through its file filter or its folder (11-06 report)
+        ("Grep", {"pattern": ".", "path": "C:\\Users\\me\\.claude", "glob": ".credentials.json"}),
+        ("Grep", {"pattern": ".", "path": "C:\\Users\\me\\.claude", "glob": "*.json"}),
+        ("Grep", {"pattern": ".", "path": "C:\\Users\\me\\.claude"}),
+        ("Grep", {"pattern": ".", "path": "/c/Users/me/.claude", "glob": "!*.md"}),
+        ("Grep", {"pattern": "token", "path": "C:\\Users\\me\\.codex", "glob": "auth.json"}),
+        ("Grep", {"pattern": ".", "path": "C:\\Users\\me", "glob": "**/*.json"}),
+        ("Grep", {"pattern": "x", "path": "C:\\Users\\me", "glob": ".ssh/id_ed25519"}),
+        ("Grep", {"pattern": "x", "path": "C:\\Users\\me\\AppData\\Local"}),
+        ("Grep", {"pattern": "x", "path": "C:\\"}),
+        ("Grep", {"pattern": "token", "path": "C:\\AI\\.agent"}),
+        ("Glob", {"pattern": "**/.credentials.json", "path": "C:\\Users\\me\\.claude"}),
         ("Write", {"file_path": "C:\\AI\\.agent\\tgterm.py", "content": "x"}),
         ("Write", {"file_path": "C:\\AI\\.agent\\allow-once", "content": ""}),
         ("Edit", {"file_path": "C:\\Users\\me\\.claude\\settings.json", "old_string": "\"hooks\": {", "new_string": "\"x\": {"}),
@@ -599,6 +704,10 @@ def selftest():
         ("Bash", {"command": "docker run -d vaultwarden/server"}),
         ("Glob", {"pattern": "**/*.py", "path": "C:\\AI\\app"}),
         ("Grep", {"pattern": "vault", "path": "C:\\AI\\app", "glob": "*.md"}),
+        ("Grep", {"pattern": "x", "path": "C:\\Users\\me\\.claude", "glob": "*.md"}),
+        ("Grep", {"pattern": "x", "path": "C:\\Users\\me\\.claude\\projects"}),
+        ("Grep", {"pattern": "x", "path": "C:\\Users\\me\\Documents"}),
+        ("Grep", {"pattern": "x", "path": "C:\\Users\\me\\AppData\\Local\\Temp\\claude"}),
     ]
     agy_block = [
         {"name": "run_command", "args": {"CommandLine": "Remove-Item C:\\Users\\me\\Documents -Recurse -Force"}},
@@ -632,11 +741,37 @@ def selftest():
         if is_hard(check_tool(name, args)) != ((name, args) in vault_hard):
             bad.append("hard block %s: %s %s" % ("expected" if (name, args) in vault_hard else "unexpected", name, args))
     bad += selftest_allow_once()
-    total = len(block) * 2 + len(allow) + len(agy_block) + len(agy_allow) + 4
+    bad += selftest_search()
+    total = len(block) * 2 + len(allow) + len(agy_block) + len(agy_allow) + 4 + 6
     for b in bad:
         print("FAIL", b)
     print("guard selftest: %d/%d ok" % (total - len(bad), total))
     return 1 if bad else 0
+
+
+def selftest_search():
+    """a Grep from the AI's working folder: the agent folder must be skipped by .ignore (a temp copy of the layout)"""
+    import shutil, tempfile
+    d = os.path.realpath(tempfile.mkdtemp())             # %TEMP% can be a short 8.3 name; the guard resolves those
+    root = win_path(d).rstrip("/") + "/ai"
+    agents = {root + "/.agent"}
+    bad = []
+    try:
+        os.makedirs(os.path.join(d, "ai", ".agent"))
+        got = [check_search(search_root("", root), "", agents),          # no .ignore yet: the search would read .agent
+               check_search(search_root("app", root), "", agents)]       # a subfolder: fine
+        with open(os.path.join(d, "ai", ".ignore"), "w", encoding="utf-8") as f:
+            f.write("node_modules/\n.agent/\n")
+        got += [check_search(search_root("", root), "", agents),
+                check_search(search_root("", root), "*.json", agents),   # a filter cannot reach into a skipped folder
+                check_search(search_root("", root), ".agent/*", agents),
+                check_search(search_root(root + "/.agent", ""), "*.log", agents)]
+        want = [True, False, False, False, True, True]
+        bad = ["search %d: want %s, got %r" % (i, "block" if w else "allow", g)
+               for i, (w, g) in enumerate(zip(want, got)) if bool(g) != w]
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return bad
 
 
 def selftest_allow_once():
