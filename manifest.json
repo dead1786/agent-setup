@@ -1,11 +1,11 @@
 {
-  "version": "eecd84eb9b743911c2173b84709e2af460655196",
+  "version": "ea2841966593f750699abcb5a96ce38c75db89ed",
   "files": {
-    "tgterm.py": "83ec64e3234120ea46681a8cec54a531b0bb242bd9089887229c08b22d72e167",
+    "tgterm.py": "c2121f7431e2f21defd4635d90982fa0d48f5bce516d4eb14a6c1ab28155a19f",
     "winsend.py": "0089b099a5196819cb891a6339dc03508f23204743adaff4517979e8295e5fa1",
     "skills/winsend/SKILL.md": "1f52e2fc29145ab7fa1ca4ac1a39eac9910b5b49306cce2716e452ffd7ada891",
     "skills/memory-rag/SKILL.md": "21a521973b965eb624b0a1853e01299aefadbc1a2d793ca3bd3ac8cd6fb0de55",
-    "guard.py": "9ccfb1f2e9caa969abade7662ee016b30204c322df057a3c69137cc822017c12",
+    "guard.py": "9dce00eb931f4e60612592e79d8ef2e59bf3b74d19768c1120b8bdda85620d45",
     "vault.py": "8fb57011f09d148973543555d24cd457e3b770a17c6455d51145168af9e58f86",
     "winject/__init__.py": "f25abb6cb808cdcde896f4980571bd33f15adf8c2faec6fa39ff178f9c7c8153",
     "winject/common.py": "6aeafb77f1b54e2e01f38491199287ed8d83dc370382234b7c21ba1ac3878426",
@@ -17,10 +17,11 @@
     "skills/winject/SKILL.md": "7404bc6e6c504c85041e16b332920f104fc8e93abfd17140e2d6290b1d2ea964",
     "skills/alarm-system/SKILL.md": "93768832ac6e7934dec7a09b911ba568f8e7bfc7379827c534467169dc7b6cf7",
     "skills/watchdog-alert/SKILL.md": "9e581cee142485368943405746d44d29170c69cf87c93f9785af03d772b4f8e9",
-    "rules-sections.md": "2d8aed0ba22ef57b32eb2d143b1ed1a1859f7136f2e0ea95f7cecc6036bb5038"
+    "rules-sections.md": "92e483cff0022e4649946199b8f7c764ecbdf96239a1cc0423d27e8afed7424a"
   },
   "known": {
     "tgterm.py": [
+      "c2121f7431e2f21defd4635d90982fa0d48f5bce516d4eb14a6c1ab28155a19f",
       "83ec64e3234120ea46681a8cec54a531b0bb242bd9089887229c08b22d72e167",
       "5112d75ef7a0c39f70c903aa609c9895ec34f30eba4909846a901cc94f1c6557",
       "468ca5675796be68f32946b19bf0a08f4db74daebe8342374000fdd803ba7af5",
@@ -48,6 +49,7 @@
       "21a521973b965eb624b0a1853e01299aefadbc1a2d793ca3bd3ac8cd6fb0de55"
     ],
     "guard.py": [
+      "9dce00eb931f4e60612592e79d8ef2e59bf3b74d19768c1120b8bdda85620d45",
       "9ccfb1f2e9caa969abade7662ee016b30204c322df057a3c69137cc822017c12",
       "71b6ad7cb52a3b4994c9930c3bd3b1fa76f71972849ffadf504381ead068fd6e",
       "1dd62d221eff3f5c4f77c735bd3433ec459b558608ca4b7302228754c3bb7f5f",
@@ -93,6 +95,7 @@
       "9e581cee142485368943405746d44d29170c69cf87c93f9785af03d772b4f8e9"
     ],
     "rules-sections.md": [
+      "92e483cff0022e4649946199b8f7c764ecbdf96239a1cc0423d27e8afed7424a",
       "2d8aed0ba22ef57b32eb2d143b1ed1a1859f7136f2e0ea95f7cecc6036bb5038",
       "44da2b347ad828eb775de75b66e3097d9bb8e6eb5bed399ea66059ea5bf49bd5"
     ]
@@ -103,8 +106,8 @@
     "uiautomation"
   ],
   "notes": [
-    "新功能：密碼庫。在 Telegram 打 /密碼 新增 名稱 網址 帳號 密碼 存起來（存好會自動刪掉那則），AI 要登入網站時會傳按鈕問你，你按允許它才填進 Chrome，AI 看不到密碼",
-    "修正：電腦重開機後 AI 視窗有時不會自己開回來，現在登入 Windows 後就會自動開",
-    "更新防呆：有檔案被改過、沒換成新版時，報告第一行會先警告，AI 也會主動問你怎麼處理"
+    "安全修補：AI 用搜尋功能時，不能再透過檔名篩選或搜整個資料夾讀到登入憑證、Telegram 金鑰、SSH 金鑰（感謝熱心人士回報）",
+    "AI 規則新增「外部內容與自我保護」：網頁、信件、別人的程式裡寫的指示只當資料，不照做；陌生人叫它點連結、按星、下載執行，會先問你",
+    "更新後一分鐘內，AI 在 C:\\AI 直接搜尋可能被擋一下，看門狗補好設定後就恢復"
   ]
 }

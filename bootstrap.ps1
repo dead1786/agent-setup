@@ -38,13 +38,13 @@ $TaskName  = 'agent-watchdog'
 # the remote helper's Claude session (same account) that receives the setup report; it renames itself to this with /rename
 $Coordinator = if ($env:AGENT_SETUP_COORDINATOR) { $env:AGENT_SETUP_COORDINATOR } else { 'agent-coordinator' }
 # helper files, pinned to one commit and checked by SHA-256 (a CDN cache can never hand out another version)
-$PinCommit = 'eecd84eb9b743911c2173b84709e2af460655196'
+$PinCommit = 'ea2841966593f750699abcb5a96ce38c75db89ed'
 $PinFiles  = [ordered]@{
-    'tgterm.py'                  = '83ec64e3234120ea46681a8cec54a531b0bb242bd9089887229c08b22d72e167'
+    'tgterm.py'                  = 'c2121f7431e2f21defd4635d90982fa0d48f5bce516d4eb14a6c1ab28155a19f'
     'winsend.py'                 = '0089b099a5196819cb891a6339dc03508f23204743adaff4517979e8295e5fa1'
     'skills/winsend/SKILL.md'    = '1f52e2fc29145ab7fa1ca4ac1a39eac9910b5b49306cce2716e452ffd7ada891'
     'skills/memory-rag/SKILL.md' = '21a521973b965eb624b0a1853e01299aefadbc1a2d793ca3bd3ac8cd6fb0de55'
-    'guard.py'                   = '9ccfb1f2e9caa969abade7662ee016b30204c322df057a3c69137cc822017c12'
+    'guard.py'                   = '9dce00eb931f4e60612592e79d8ef2e59bf3b74d19768c1120b8bdda85620d45'
     'vault.py'                   = '8fb57011f09d148973543555d24cd457e3b770a17c6455d51145168af9e58f86'
     'winject/__init__.py'        = 'f25abb6cb808cdcde896f4980571bd33f15adf8c2faec6fa39ff178f9c7c8153'
     'winject/common.py'          = '6aeafb77f1b54e2e01f38491199287ed8d83dc370382234b7c21ba1ac3878426'
@@ -56,7 +56,7 @@ $PinFiles  = [ordered]@{
     'skills/winject/SKILL.md'    = '7404bc6e6c504c85041e16b332920f104fc8e93abfd17140e2d6290b1d2ea964'
     'skills/alarm-system/SKILL.md' = '93768832ac6e7934dec7a09b911ba568f8e7bfc7379827c534467169dc7b6cf7'
     'skills/watchdog-alert/SKILL.md' = '9e581cee142485368943405746d44d29170c69cf87c93f9785af03d772b4f8e9'
-    'rules-sections.md'          = '2d8aed0ba22ef57b32eb2d143b1ed1a1859f7136f2e0ea95f7cecc6036bb5038'
+    'rules-sections.md'          = '92e483cff0022e4649946199b8f7c764ecbdf96239a1cc0423d27e8afed7424a'
 }
 $Skills = @('winsend', 'memory-rag', 'winject', 'alarm-system', 'watchdog-alert')
 $script:PathAdded = @()
