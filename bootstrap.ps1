@@ -176,56 +176,39 @@ $reuse = $false
 $tgBase = $null
 if (-not $DryRun -and $prev -and $prev.ai) {
     $prevTg = if ($prevCfg -and $prevCfg.token) { '@' + $prev.bot } else { '不接' }
-    $prevRemote = if ($prev.remote -eq $false) { '不要' } else { '要' }
-    Say ('找到上次的答案：遠端協助=' + $prevRemote + '　AI=' + $prev.ai + '　名字=' + $prev.agent_name + '　Telegram=' + $prevTg) 'Green'
+    Say ('找到上次的答案：AI=' + $prev.ai + '　名字=' + $prev.agent_name + '　Telegram=' + $prevTg) 'Green'
     $reuse = ((Read-Host '沿用上次的答案？ [Y/n]') -notmatch '^\s*[nN]')
 }
 if ($reuse) {
-    $remote = ($prev.remote -ne $false)
+    $remote = $false
     $ai = $prev.ai; $agentName = $prev.agent_name; $personality = $prev.personality; $style = $prev.style
     $wants = $prev.wants; $userName = $prev.user_name; $lang = $prev.language; $userWork = $prev.user_work
     $botName = $prev.bot
     $tgToken = $prevCfg.token
     $ownerId = $prevCfg.owner_id
 } else {
-    # 1. remote help or not: an explicit Y/N, no default, so nobody skips past what it means
-    Say ''
-    Say '1) 要不要「遠端安裝協助」？' 'Cyan'
-    Say '   Y＝要：' 'Cyan'
-    Say '     ・會暫時安裝 Claude Code 當「安裝助理」，由協助你的人用他自己的手機授權登入' 'Gray'
-    Say '     ・裝完自動檢查，並把檢查報告傳給協助者確認；確認後安裝助理自動結束、登出協助者的帳號' 'Gray'
-    Say '     ・安裝期間，協助者可以遠端看到安裝助理、請它重跑檢查或修正安裝檔（不能動你的其他檔案）' 'Gray'
-    Say '     ・會傳給協助者的資料：AI 名字與個性設定、你填的工作內容、軟體版本、Telegram 機器人名稱與你的 Telegram 帳號 ID、各項測試結果（不含密碼、不含 Telegram token）' 'Gray'
-    Say '   N＝不要：' 'Cyan'
-    Say '     ・全部在這台電腦完成，不會有任何資料傳給別人' 'Gray'
-    Say '     ・選 Codex／Gemini 不會安裝 Claude Code；選 Claude 就用你自己的帳號正常登入' 'Gray'
-    Say '     ・最後在這個視窗自動檢查，結果只顯示在畫面上；有問題要自己看畫面處理，或重新貼一次安裝指令' 'Gray'
-    $remote = $null
-    while ($null -eq $remote) {
-        $r = if ($DryRun) { $(if ($env:AGENT_SETUP_DRYRUN_REMOTE -eq '0') { 'n' } else { 'y' }) } else { [string](Read-Host '   請輸入 Y 或 N') }
-        if ($r -match '^\s*[yY]') { $remote = $true } elseif ($r -match '^\s*[nN]') { $remote = $false } else { Say '    請輸入 Y 或 N' 'Yellow' }
-    }
+    $remote = $false   # 11-07: the remote setup help (the owner's Claude account on someone else's PC) was removed
 
     $ai = $null
     $d1 = if ($DryRun -and $env:AGENT_SETUP_DRYRUN_AI) { $env:AGENT_SETUP_DRYRUN_AI } else { '1' }
     while (-not $ai) {
-        switch (Ask '2) 要用哪個 AI？ 1=Claude Code  2=Codex  3=Gemini（Antigravity）  [預設 1]' $d1) {
+        switch (Ask '1) 要用哪個 AI？ 1=Claude Code  2=Codex  3=Gemini（Antigravity）  [預設 1]' $d1) {
             '1' { $ai = 'claude' } '2' { $ai = 'codex' } '3' { $ai = 'gemini' }
             default { Say '    請輸入 1、2 或 3' 'Yellow' }
         }
     }
-    $agentName   = Ask '3) 幫你的 AI 取個名字 [預設 小助手]' '小助手'
-    $personality = Ask '4) 它的個性？（例：溫柔、毒舌、幽默、冷靜）[預設 親切可靠]' '親切可靠'
-    $style       = Ask '5) 說話風格？（例：簡短直接、像朋友聊天、條列重點）[預設 簡短清楚]' '簡短清楚'
-    $wants       = Ask '6) 希望它主要幫你做什麼？（例：查資料、寫文件、整理行程）[預設 日常大小事]' '日常大小事'
-    $userName    = Ask '7) 它要怎麼稱呼你？ [預設 主人]' '主人'
-    $lang        = Ask '8) 回覆用什麼語言？ [預設 繁體中文]' '繁體中文'
-    $userWork    = Ask '9) 你目前在做什麼工作或專案？（讓它更懂你；可直接按 Enter 跳過）' ''
+    $agentName   = Ask '2) 幫你的 AI 取個名字 [預設 小助手]' '小助手'
+    $personality = Ask '3) 它的個性？（例：溫柔、毒舌、幽默、冷靜）[預設 親切可靠]' '親切可靠'
+    $style       = Ask '4) 說話風格？（例：簡短直接、像朋友聊天、條列重點）[預設 簡短清楚]' '簡短清楚'
+    $wants       = Ask '5) 希望它主要幫你做什麼？（例：查資料、寫文件、整理行程）[預設 日常大小事]' '日常大小事'
+    $userName    = Ask '6) 它要怎麼稱呼你？ [預設 主人]' '主人'
+    $lang        = Ask '7) 回覆用什麼語言？ [預設 繁體中文]' '繁體中文'
+    $userWork    = Ask '8) 你目前在做什麼工作或專案？（讓它更懂你；可直接按 Enter 跳過）' ''
 
     $tgToken = $null; $botName = $null; $ownerId = $null
     if ($DryRun -and $env:AGENT_SETUP_DRYRUN_TG -eq '1') { $tgToken = 'dry-run-token'; $botName = 'dry_run_bot'; $ownerId = [long]123456789 }
     while (-not $DryRun) {
-        $t = (Read-Host '10) Telegram 機器人 token（找 @BotFather 開機器人拿到的；不接 Telegram 直接按 Enter）').Trim()
+        $t = (Read-Host '9) Telegram 機器人 token（找 @BotFather 開機器人拿到的；不接 Telegram 直接按 Enter）').Trim()
         if (-not $t) { break }
         try { $me = Invoke-RestMethod -Uri "https://api.telegram.org/bot$t/getMe" -TimeoutSec 20 } catch { $me = $null }
         if ($me -and $me.ok) { $tgToken = $t; $botName = $me.result.username; Say "    OK：@$botName" 'Green'; break }
@@ -238,7 +221,7 @@ if ($reuse) {
         $tgBase = 0
         try { $old = Invoke-RestMethod "$api/getUpdates?offset=-1&timeout=0" -TimeoutSec 20; if (@($old.result).Count) { $tgBase = [long]@($old.result)[-1].update_id + 1 } } catch {}
         while (-not $ownerId) {
-            $null = Read-Host "11) 用你自己的 Telegram 打開 @$botName，按「開始」或傳任何一句話；傳完回來這裡按 Enter"
+            $null = Read-Host "10) 用你自己的 Telegram 打開 @$botName，按「開始」或傳任何一句話；傳完回來這裡按 Enter"
             try {
                 $up = Invoke-RestMethod "$api/getUpdates?offset=$tgBase&timeout=10" -TimeoutSec 30
                 $m = @($up.result) | Where-Object { $_.message -and $_.message.chat.type -eq 'private' } | Select-Object -First 1
@@ -264,7 +247,7 @@ $NeedClaude = ($remote -or $ai -eq 'claude')
 $answers = [ordered]@{ remote = $remote; ai = $ai; agent_name = $agentName; personality = $personality; style = $style; wants = $wants
     user_name = $userName; language = $lang; user_work = $userWork; bot = $botName; owner_id = $ownerId; created = (Get-Date).ToString('s') }
 Write-Text (Join-Path $AgentDir 'answers.json') ($answers | ConvertTo-Json)
-Say ('設定：遠端協助=' + $(if ($remote) { '要' } else { '不要' }) + '　AI=' + $ai + '　名字=' + $agentName + '　稱呼=' + $userName + '　語言=' + $lang + '　Telegram=' + $(if ($tg) { '@' + $botName } else { '不接' })) 'Green'
+Say ('設定：AI=' + $ai + '　名字=' + $agentName + '　稱呼=' + $userName + '　語言=' + $lang + '　Telegram=' + $(if ($tg) { '@' + $botName } else { '不接' })) 'Green'
 
 if (-not $DryRun) {
     New-Item -ItemType Directory -Force -Path $Root, $AgentDir, $MemDir, $ToolsDir, $SetupDir, $UserBin | Out-Null
